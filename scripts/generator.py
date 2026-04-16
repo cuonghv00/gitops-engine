@@ -243,12 +243,56 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
     env_list = full_app.get("env", [])
     env_keys = full_app.get("env_vars", []) # New simplified key
     
-    # Auto-set containerPort from service port if not explicitly set
+    # 6. Service Configuration (Smart Defaults)
     svc_cfg = full_app.get("service", {})
-    svc_port = svc_cfg.get("port", 80)
-    container_port = full_app.get("port") or svc_port
+    ingress_cfg = full_app.get("ingress", {})
+    app_port = full_app.get("port", 80)
+    
+    # Auto-enable service if ingress is present or service block is present
+    if (ingress_cfg.get("enabled") or svc_cfg) and not svc_cfg:
+        svc_cfg = {}
 
-    # If operator just provided a list of keys, map them to shared resources
+    if svc_cfg or ingress_cfg.get("enabled"):
+        # Port precedence: service.port > ingress.servicePort > app_port
+        resolved_svc_port = svc_cfg.get("port") or ingress_cfg.get("servicePort") or app_port
+        target_port = svc_cfg.get("targetPort") or app_port
+        
+        new_svc_cfg = {
+            "type": svc_cfg.get("type", "ClusterIP"),
+            "port": resolved_svc_port,
+            "targetPort": target_port
+        }
+        
+        if new_svc_cfg["type"] == "NodePort" and "nodePort" in svc_cfg:
+            new_svc_cfg["nodePort"] = svc_cfg["nodePort"]
+            
+        svc_cfg = new_svc_cfg
+        svc_final_port = resolved_svc_port
+    else:
+        svc_final_port = 80
+
+    container_port = app_port
+
+    # 7. Ingress Transformation (Simplified -> Standard)
+    if ingress_cfg.get("enabled"):
+        # If user used the simplified 'host' field, convert it to the library standard
+        if "host" in ingress_cfg and "hosts" not in ingress_cfg:
+            simple_host = ingress_cfg.pop("host")
+            ingress_cfg["hosts"] = [{
+                "host": simple_host,
+                "paths": [{
+                    "path": "/",
+                    "pathType": "ImplementationSpecific"
+                }]
+            }]
+        
+        # Ensure ingress points to the correct service port
+        if "hosts" in ingress_cfg:
+            for host_entry in ingress_cfg["hosts"]:
+                for path_entry in host_entry.get("paths", []):
+                    path_entry["servicePort"] = svc_final_port
+
+    # Environment Variables Mapping (Shared Resources aware)
     for key in env_keys:
         if key in secret_pool:
             env_list.append({

@@ -1,11 +1,11 @@
 type: deployment
 image:
-  repository: registry.vn/ecommerce/api-gateway
+  repository: registry.vn/ecommerce/payment-service
   tag: null
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
-  containerPort: 80
+  containerPort: 9090
   resources: {}
   strategy:
     type: RollingUpdate
@@ -26,11 +26,6 @@ deployment:
       configMapKeyRef:
         name: ecommerce-config
         key: LOG_LEVEL
-  - name: GATEWAY_TIMEOUT
-    valueFrom:
-      configMapKeyRef:
-        name: ecommerce-config
-        key: GATEWAY_TIMEOUT
   volumes:
   - name: tmp
     emptyDir: {}
@@ -38,35 +33,13 @@ deployment:
   - name: tmp
     mountPath: /tmp
   affinity: {}
-  livenessProbe:
-    initialDelaySeconds: 10
-    periodSeconds: 5
-    timeoutSeconds: 2
-    failureThreshold: 3
-    httpGet:
-      path: /
-      port: 80
-  readinessProbe:
-    initialDelaySeconds: 10
-    periodSeconds: 5
-    timeoutSeconds: 2
-    failureThreshold: 3
-    httpGet:
-      path: /
-      port: 80
 serviceAccount:
   create: false
   name: default
 service:
-  type: ClusterIP
+  type: NodePort
   port: 80
-  targetPort: 80
-ingress:
-  enabled: true
-  hosts:
-  - host: api.example.com
-    paths:
-    - path: /
-      pathType: ImplementationSpecific
-      servicePort: 80
+  targetPort: 9090
+  nodePort: 30005
+ingress: {}
 genConfigMaps: false
