@@ -1,11 +1,11 @@
 type: deployment
 image:
-  repository: registry.vn/ecommerce/user-service
+  repository: registry.vn/ecommerce/redis-proxy
   tag: null
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
-  containerPort: 8080
+  containerPort: 6379
   resources: {}
   strategy:
     type: RollingUpdate
@@ -26,21 +26,6 @@ deployment:
       configMapKeyRef:
         name: ecommerce-config
         key: LOG_LEVEL
-  - name: DB_HOST
-    valueFrom:
-      configMapKeyRef:
-        name: ecommerce-config
-        key: DB_HOST
-  - name: DB_PASSWORD
-    valueFrom:
-      secretKeyRef:
-        name: ecommerce-secret
-        key: DB_PASSWORD
-  - name: JWT_SECRET
-    valueFrom:
-      secretKeyRef:
-        name: ecommerce-secret
-        key: JWT_SECRET
   volumes:
   - name: tmp
     emptyDir: {}
@@ -49,21 +34,19 @@ deployment:
     mountPath: /tmp
   affinity: {}
   livenessProbe:
-    initialDelaySeconds: 30
+    initialDelaySeconds: 10
     periodSeconds: 5
     timeoutSeconds: 2
     failureThreshold: 3
-    httpGet:
-      path: /liveness
-      port: 8080
+    tcpSocket:
+      port: 6379
   readinessProbe:
     initialDelaySeconds: 10
-    periodSeconds: 2
+    periodSeconds: 5
     timeoutSeconds: 2
     failureThreshold: 3
-    httpGet:
-      path: /health
-      port: 8080
+    tcpSocket:
+      port: 6379
 serviceAccount:
   create: false
   name: default

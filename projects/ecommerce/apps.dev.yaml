@@ -1,0 +1,49 @@
+project: "ecommerce"
+common_version: "1.0.0"
+namespace: "ecommerce"
+image_repo: "registry.vn/ecommerce"
+
+apps:
+  - name: "api-gateway"
+    port: 80
+    ingress:
+      enabled: true
+      host: "api.example.com"
+    health:
+      enabled: true
+      path: "/"           # Explicitly HTTP
+    env_vars:
+      - LOG_LEVEL
+      - GATEWAY_TIMEOUT
+
+  - name: "user-service"
+    port: 8080
+    health:
+      enabled: true
+      path: "/health"      # Global path for both
+      liveness:
+        path: "/liveness"  # Override path
+        initialDelaySeconds: 30
+      readiness:
+        periodSeconds: 2    # Override timing
+    env_vars:
+      - LOG_LEVEL
+      - DB_HOST
+      - DB_PASSWORD
+      - JWT_SECRET
+
+  - name: "order-service"
+    port: 8080
+    env_vars:
+      - LOG_LEVEL
+      - DB_HOST
+      - DB_PASSWORD
+      - REDIS_URL
+      - STRIPE_API_KEY
+
+  - name: "redis-proxy"
+    port: 6379
+    health:
+      enabled: true      # No path defined -> should use tcpSocket
+    env_vars:
+      - LOG_LEVEL

@@ -1,6 +1,6 @@
 type: deployment
 image:
-  repository: registry.vn/ecommerce/user-service
+  repository: registry.vn/ecommerce/order-service
   tag: null
   pullPolicy: IfNotPresent
 deployment:
@@ -36,11 +36,16 @@ deployment:
       secretKeyRef:
         name: ecommerce-secret
         key: DB_PASSWORD
-  - name: JWT_SECRET
+  - name: REDIS_URL
+    valueFrom:
+      configMapKeyRef:
+        name: ecommerce-config
+        key: REDIS_URL
+  - name: STRIPE_API_KEY
     valueFrom:
       secretKeyRef:
         name: ecommerce-secret
-        key: JWT_SECRET
+        key: STRIPE_API_KEY
   volumes:
   - name: tmp
     emptyDir: {}
@@ -48,22 +53,6 @@ deployment:
   - name: tmp
     mountPath: /tmp
   affinity: {}
-  livenessProbe:
-    initialDelaySeconds: 30
-    periodSeconds: 5
-    timeoutSeconds: 2
-    failureThreshold: 3
-    httpGet:
-      path: /liveness
-      port: 8080
-  readinessProbe:
-    initialDelaySeconds: 10
-    periodSeconds: 2
-    timeoutSeconds: 2
-    failureThreshold: 3
-    httpGet:
-      path: /health
-      port: 8080
 serviceAccount:
   create: false
   name: default

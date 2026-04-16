@@ -1,0 +1,10 @@
+apiVersion: v2
+name: ecommerce-shared
+description: Shared resources for project ecommerce-shared — managed by generator.py
+type: application
+version: 0.1.0
+dependencies:
+- name: common-lib
+  version: 1.0.0
+  repository: file://../../../../helm-templates/common-lib
+  alias: common-lib

@@ -185,27 +185,59 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
             "configMap": {"name": cm_name}
         })
 
-    # 5. Health Check Simplification
+    # 5. Health Check (v3 Hierarchical Logic)
     health_cfg = full_app.get("health", {})
-    liveness = full_app.get("livenessProbe") or health_cfg.get("livenessProbe")
-    readiness = full_app.get("readinessProbe") or health_cfg.get("readinessProbe")
+    health_enabled = health_cfg.get("enabled", False)
     
-    if health_cfg.get("enabled"):
-        probe_path = health_cfg.get("path", "/")
-        probe_port = health_cfg.get("port") or full_app.get("port", 80)
+    liveness = None
+    readiness = None
+
+    if health_enabled:
+        app_port = full_app.get("port", 80)
         
-        # If standard probes are missing, build from simplified health_cfg
-        default_probe = {
-            "httpGet": {"path": probe_path, "port": probe_port},
+        # Base parameters for all probes
+        base_params = {
+            "path": health_cfg.get("path"),  # No default here, let build_probe decide
+            "port": health_cfg.get("port") or app_port,
             "initialDelaySeconds": health_cfg.get("initialDelaySeconds", 10),
             "periodSeconds": health_cfg.get("periodSeconds", 5),
             "timeoutSeconds": health_cfg.get("timeoutSeconds", 2),
             "failureThreshold": health_cfg.get("failureThreshold", 3)
         }
-        if not liveness:
-            liveness = default_probe
-        if not readiness:
-            readiness = default_probe
+
+        def build_probe(type_key: str):
+            # Check for top-level probe definition first (v1 style)
+            explicit_probe = full_app.get(f"{type_key}Probe")
+            if explicit_probe:
+                return explicit_probe
+
+            # Helper to merge: base_params < health_cfg < health[type_key]
+            type_cfg = health_cfg.get(type_key, {})
+            if isinstance(type_cfg, str): # Handle short-form: liveness: "/healthz"
+                type_cfg = {"path": type_cfg}
+            
+            merged = {**base_params, **type_cfg}
+            
+            probe_def = {
+                "initialDelaySeconds": merged["initialDelaySeconds"],
+                "periodSeconds": merged["periodSeconds"],
+                "timeoutSeconds": merged["timeoutSeconds"],
+                "failureThreshold": merged["failureThreshold"]
+            }
+
+            # Switch between HTTP and TCP based on presence of path
+            if merged.get("path"):
+                probe_def["httpGet"] = {"path": merged["path"], "port": merged["port"]}
+            else:
+                probe_def["tcpSocket"] = {"port": merged["port"]}
+
+            return probe_def
+
+        liveness = build_probe("liveness")
+        readiness = build_probe("readiness")
+
+    # 6. Environment Variables Mapping (Shared Resources aware)
+    # ... (rest of the logic remains same, just ensuring we don't output nulls later)
 
     # 6. Environment Variables Mapping (Shared Resources aware)
     env_list = full_app.get("env", [])
@@ -245,6 +277,25 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
     # Priority: app.imagePullSecrets > global_defaults.imagePullSecrets > default [{"name": "regcred"}]
     image_pull_secrets = full_app.get("imagePullSecrets") or global_defaults.get("imagePullSecrets") or [{"name": "regcred"}]
 
+    deployment_data = {
+        "replicas": full_app.get("replicas", 1),
+        "containerPort": container_port,
+        "resources": full_app.get("resources", {}),
+        "strategy": {"type": full_app.get("strategy", "RollingUpdate")},
+        "securityContext": sec_ctx,
+        "imagePullSecrets": image_pull_secrets,
+        "env": env_list,
+        "volumes": volumes,
+        "volumeMounts": volume_mounts,
+        "affinity": full_app.get("affinity", {})
+    }
+    
+    # Only add probes if they are configured
+    if liveness:
+        deployment_data["livenessProbe"] = liveness
+    if readiness:
+        deployment_data["readinessProbe"] = readiness
+
     values: dict = {
         "type": full_app.get("type", "deployment"),
         "image": {
@@ -252,20 +303,7 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
             "tag": tag,
             "pullPolicy": full_app.get("pullPolicy", "IfNotPresent"),
         },
-        "deployment": {
-            "replicas": full_app.get("replicas", 1),
-            "containerPort": container_port,
-            "resources": full_app.get("resources", {}),
-            "strategy": {"type": full_app.get("strategy", "RollingUpdate")},
-            "securityContext": sec_ctx,
-            "imagePullSecrets": image_pull_secrets,
-            "livenessProbe": liveness,
-            "readinessProbe": readiness,
-            "env": env_list,
-            "volumes": volumes,
-            "volumeMounts": volume_mounts,
-            "affinity": full_app.get("affinity", {})
-        },
+        "deployment": deployment_data,
         "serviceAccount": {
             "create": False,
             "name": full_app.get("serviceAccount", "default"),

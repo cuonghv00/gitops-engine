@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-config
+data:
+  DB_HOST: postgres.ecommerce.svc.cluster.local
+  REDIS_URL: redis://cache.ecommerce.svc.cluster.local:6379
+  LOG_LEVEL: info
+  GATEWAY_TIMEOUT: 60s

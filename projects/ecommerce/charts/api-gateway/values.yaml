@@ -1,18 +1,12 @@
 type: deployment
 image:
-  repository: registry.vn/gateway
-  tag: latest
+  repository: registry.vn/ecommerce/api-gateway
+  tag: null
   pullPolicy: IfNotPresent
 deployment:
-  replicas: 3
-  containerPort: 8080
-  resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 512Mi
+  replicas: 1
+  containerPort: 80
+  resources: {}
   strategy:
     type: RollingUpdate
   securityContext:
@@ -20,47 +14,51 @@ deployment:
     allowPrivilegeEscalation: false
     runAsNonRoot: true
     runAsUser: 1000
+    runAsGroup: 1000
     capabilities:
       drop:
       - ALL
+  imagePullSecrets:
+  - name: regcred
   env:
   - name: LOG_LEVEL
-    value: debug
+    valueFrom:
+      configMapKeyRef:
+        name: ecommerce-config
+        key: LOG_LEVEL
+  - name: GATEWAY_TIMEOUT
+    valueFrom:
+      configMapKeyRef:
+        name: ecommerce-config
+        key: GATEWAY_TIMEOUT
   volumes:
-  - name: config-volume
-    configMap:
-      name: api-gateway-config
-  - name: api-gateway-tmp
+  - name: tmp
     emptyDir: {}
   volumeMounts:
-  - name: config-volume
-    mountPath: /etc/config
-  - name: api-gateway-tmp
+  - name: tmp
     mountPath: /tmp
-  affinity:
-    podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        podAffinityTerm:
-          labelSelector:
-            matchExpressions:
-            - key: app.kubernetes.io/name
-              operator: In
-              values:
-              - api-gateway
-          topologyKey: kubernetes.io/hostname
+  affinity: {}
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    httpGet:
+      path: /
+      port: 80
+  readinessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    httpGet:
+      path: /
+      port: 80
 serviceAccount:
   create: false
-  name: ''
-service:
-  enabled: true
-  type: ClusterIP
-  port: 80
+  name: default
+service: {}
 ingress:
   enabled: true
-  className: nginx
-  hosts:
-  - host: api.my-platform.com
-    paths:
-    - path: /
-      pathType: Prefix
+  host: api.example.com
+genConfigMaps: false

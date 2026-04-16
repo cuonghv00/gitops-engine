@@ -1,6 +1,6 @@
 apiVersion: v2
-name: payment-service
-description: Application chart for payment-service — managed by generator.py
+name: order-service
+description: Application chart for order-service — managed by generator.py
 type: application
 version: 0.1.0
 dependencies:
