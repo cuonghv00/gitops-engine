@@ -20,14 +20,10 @@ deployment:
       - ALL
   imagePullSecrets:
   - name: regcred
-  livenessProbe: null
-  readinessProbe: null
-  env:
-  - name: DB_HOST
-    valueFrom:
-      configMapKeyRef:
-        name: multi-apps-test-config
-        key: DB_HOST
+  envFrom:
+  - configMapRef:
+      name: multi-apps-test-config
+  env: []
   volumes:
   - name: tmp
     emptyDir: {}
@@ -40,4 +36,5 @@ serviceAccount:
   name: default
 service: {}
 ingress: {}
-genConfigMaps: false
+localConfig:
+  enabled: false

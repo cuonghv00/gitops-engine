@@ -12,9 +12,9 @@ apps:
     health:
       enabled: true
       path: "/"           # Explicitly HTTP
-    env_vars:
-      - LOG_LEVEL
-      - GATEWAY_TIMEOUT
+    envFrom:
+      - configMapRef:
+          name: "external-global-config"
 
   - name: "user-service"
     port: 8080
@@ -27,18 +27,13 @@ apps:
       readiness:
         periodSeconds: 2    # Override timing
     env_vars:
-      - LOG_LEVEL
-      - DB_HOST
       - DB_PASSWORD
       - JWT_SECRET
 
   - name: "order-service"
     port: 8080
     env_vars:
-      - LOG_LEVEL
-      - DB_HOST
       - DB_PASSWORD
-      - REDIS_URL
       - STRIPE_API_KEY
 
   - name: "payment-service"
@@ -47,12 +42,8 @@ apps:
       type: NodePort
       port: 80
       nodePort: 30005
-    env_vars:
-      - LOG_LEVEL
 
   - name: "redis-proxy"
     port: 6379
     health:
       enabled: true      # No path defined -> should use tcpSocket
-    env_vars:
-      - LOG_LEVEL

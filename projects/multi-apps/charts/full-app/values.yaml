@@ -26,8 +26,9 @@ deployment:
       - ALL
   imagePullSecrets:
   - name: regcred
-  livenessProbe: null
-  readinessProbe: null
+  envFrom:
+  - configMapRef:
+      name: multi-apps-test-config
   env:
   - name: APP_MODE
     value: production
@@ -41,11 +42,6 @@ deployment:
       secretKeyRef:
         name: multi-apps-test-secret
         key: API_TOKEN
-  - name: DOMAIN
-    valueFrom:
-      configMapKeyRef:
-        name: multi-apps-test-config
-        key: DOMAIN
   volumes:
   - name: custom-data
     emptyDir: {}
@@ -56,10 +52,19 @@ deployment:
 serviceAccount:
   create: false
   name: default
-service: {}
+service:
+  type: ClusterIP
+  port: 9000
+  targetPort: 9000
 ingress:
   enabled: true
-  host: full.example.com
   annotations:
     kubernetes.io/ingress.class: nginx
-genConfigMaps: true
+  hosts:
+  - host: full.example.com
+    paths:
+    - path: /
+      pathType: ImplementationSpecific
+      servicePort: 9000
+localConfig:
+  enabled: false

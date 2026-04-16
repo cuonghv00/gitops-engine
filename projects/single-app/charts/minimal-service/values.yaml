@@ -1,11 +1,11 @@
 type: deployment
 image:
-  repository: registry.vn/ecommerce/payment-service
+  repository: registry.vn/test/minimal-service
   tag: null
   pullPolicy: IfNotPresent
 deployment:
   replicas: 1
-  containerPort: 9090
+  containerPort: 80
   resources: {}
   strategy:
     type: RollingUpdate
@@ -22,7 +22,7 @@ deployment:
   - name: regcred
   envFrom:
   - configMapRef:
-      name: ecommerce-config
+      name: single-app-test-config
   env: []
   volumes:
   - name: tmp
@@ -34,11 +34,7 @@ deployment:
 serviceAccount:
   create: false
   name: default
-service:
-  type: NodePort
-  port: 80
-  targetPort: 9090
-  nodePort: 30005
+service: {}
 ingress: {}
 localConfig:
   enabled: false

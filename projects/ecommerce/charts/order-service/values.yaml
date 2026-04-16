@@ -20,27 +20,15 @@ deployment:
       - ALL
   imagePullSecrets:
   - name: regcred
+  envFrom:
+  - configMapRef:
+      name: ecommerce-config
   env:
-  - name: LOG_LEVEL
-    valueFrom:
-      configMapKeyRef:
-        name: ecommerce-config
-        key: LOG_LEVEL
-  - name: DB_HOST
-    valueFrom:
-      configMapKeyRef:
-        name: ecommerce-config
-        key: DB_HOST
   - name: DB_PASSWORD
     valueFrom:
       secretKeyRef:
         name: ecommerce-secret
         key: DB_PASSWORD
-  - name: REDIS_URL
-    valueFrom:
-      configMapKeyRef:
-        name: ecommerce-config
-        key: REDIS_URL
   - name: STRIPE_API_KEY
     valueFrom:
       secretKeyRef:
@@ -58,4 +46,5 @@ serviceAccount:
   name: default
 service: {}
 ingress: {}
-genConfigMaps: false
+localConfig:
+  enabled: false

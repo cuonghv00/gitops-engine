@@ -20,26 +20,10 @@ deployment:
       - ALL
   imagePullSecrets:
   - name: regcred
-  livenessProbe: &id001
-    httpGet:
-      path: /healthz
-      port: 8080
-    initialDelaySeconds: 10
-    periodSeconds: 5
-    timeoutSeconds: 2
-    failureThreshold: 3
-  readinessProbe: *id001
+  envFrom:
+  - configMapRef:
+      name: multi-apps-test-config
   env:
-  - name: DB_HOST
-    valueFrom:
-      configMapKeyRef:
-        name: multi-apps-test-config
-        key: DB_HOST
-  - name: LOG_LEVEL
-    valueFrom:
-      configMapKeyRef:
-        name: multi-apps-test-config
-        key: LOG_LEVEL
   - name: DATABASE_PASSWORD
     valueFrom:
       secretKeyRef:
@@ -58,11 +42,36 @@ deployment:
     mountPath: /app/.env
     subPath: .env
   affinity: {}
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    httpGet:
+      path: /healthz
+      port: 8080
+  readinessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+    httpGet:
+      path: /healthz
+      port: 8080
 serviceAccount:
   create: false
   name: default
-service: {}
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
 ingress:
   enabled: true
-  host: normal.example.com
-genConfigMaps: false
+  hosts:
+  - host: normal.example.com
+    paths:
+    - path: /
+      pathType: ImplementationSpecific
+      servicePort: 8080
+localConfig:
+  enabled: false

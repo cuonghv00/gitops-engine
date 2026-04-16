@@ -6,18 +6,14 @@ imagePullSecrets:
   - name: "regcred"
 
 apps:
-  # 1. Tối giản (Minimal) - Chỉ lấy DB_HOST
+  # 1. Tối giản (Minimal)
   - name: "minimal-app"
-    env_vars:
-      - DB_HOST
 
   # 2. Bình thường (Normal) - Lấy nhiều biến và mount thành file .env
   - name: "normal-app"
     port: 8080
     mount_env_file: true
     env_vars:
-      - DB_HOST
-      - LOG_LEVEL
       - DATABASE_PASSWORD
     ingress:
       enabled: true
@@ -33,7 +29,6 @@ apps:
     env_vars:
       - DATABASE_PASSWORD
       - API_TOKEN
-      - DOMAIN
     resources:
       requests:
         cpu: "200m"
@@ -52,7 +47,8 @@ apps:
       host: "full.example.com"
       annotations:
         kubernetes.io/ingress.class: "nginx"
-    genConfigMaps: true
+    localConfig:
+      enabled: true
     volumes:
       - name: "custom-data"
         emptyDir: {}

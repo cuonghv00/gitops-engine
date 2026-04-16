@@ -292,8 +292,23 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
                 for path_entry in host_entry.get("paths", []):
                     path_entry["servicePort"] = svc_final_port
 
-    # Environment Variables Mapping (Shared Resources aware)
+    # 8. Shared Resources via envFrom (ConfigMap only as requested)
+    # Start with the smart default (shared project config)
+    env_from = [
+        {"configMapRef": {"name": f"{project_name}-config"}}
+    ]
+    
+    # Allow additional envFrom entries from the app definition
+    extra_env_from = full_app.get("envFrom", [])
+    if isinstance(extra_env_from, list):
+        env_from.extend(extra_env_from)
+
+    # 9. Environment Variables Mapping (Secrets & Overrides)
+    env_list = full_app.get("env", [])
+    env_keys = full_app.get("env_vars", [])
+    
     for key in env_keys:
+        # We keep secrets explicit in the env list as requested
         if key in secret_pool:
             env_list.append({
                 "name": key,
@@ -304,20 +319,9 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
                     }
                 }
             })
-        elif key in config_pool:
-            env_list.append({
-                "name": key,
-                "valueFrom": {
-                    "configMapKeyRef": {
-                        "name": f"{project_name}-config",
-                        "key": key
-                    }
-                }
-            })
-        else:
-            print(f"  [WARNING] Key '{key}' not found in variables.env for app {app_name}")
+        # Note: We skip config_pool keys because they are already covered by envFrom above
 
-    # 7. Image Pull Secrets
+    # 10. Image Pull Secrets
     # Priority: app.imagePullSecrets > global_defaults.imagePullSecrets > default [{"name": "regcred"}]
     image_pull_secrets = full_app.get("imagePullSecrets") or global_defaults.get("imagePullSecrets") or [{"name": "regcred"}]
 
@@ -328,6 +332,7 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
         "strategy": {"type": full_app.get("strategy", "RollingUpdate")},
         "securityContext": sec_ctx,
         "imagePullSecrets": image_pull_secrets,
+        "envFrom": env_from,
         "env": env_list,
         "volumes": volumes,
         "volumeMounts": volume_mounts,
@@ -354,7 +359,9 @@ def build_values_yaml(app: dict, global_defaults: dict, project_vars: tuple[dict
         },
         "service": svc_cfg,
         "ingress": full_app.get("ingress", {}),
-        "genConfigMaps": full_app.get("genConfigMaps", False)
+        "localConfig": {
+            "enabled": full_app.get("genConfigMaps", False)
+        }
     }
 
     return values

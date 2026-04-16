@@ -1,0 +1,10 @@
+apiVersion: v2
+name: minimal-service
+description: Application chart for minimal-service — managed by generator.py
+type: application
+version: 0.1.0
+dependencies:
+- name: common-lib
+  version: 1.0.0
+  repository: file://../../../../helm-templates/common-lib
+  alias: common-lib
