@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.generator import (
-    ProjectDefinition, AppConfig, EnvItem, VolumeItem, ProjectPVC,
-    build_values_yaml, build_env_items, build_volume_items,
+    ProjectDefinition, AppConfig, EnvItem, VolumeItem, ProjectPVC, ServicePort,
+    build_values_yaml, build_env_items, build_volume_items, build_project_pvcs_yaml,
     parse_env_file, _validate_k8s_name,
 )
 
@@ -494,6 +494,145 @@ results.append(test('value with = inside parsed correctly',
 results.append(test('vault placeholder detected as secret',
     'VAULT_KEY' in secrets))
 results.append(test('comment line ignored', 'DB_URL' in cfg and len(cfg) == 3))
+
+
+# ===========================================================================
+# 13. BUG-1: Image URI with embedded tag must not double-stack tags
+# ===========================================================================
+section("13. BUG-1 Fix — Image URI with embedded tag")
+
+project_img = ProjectDefinition(project="proj-img", image_tag="latest", apps=[])
+
+# Case 1: Simple image:tag (e.g. redis:7.2-alpine)
+app_img1 = AppConfig(name="my-cache", image="redis:7.2-alpine")
+v1 = build_values_yaml(app_img1, project_img, ({}, []))
+results.append(test("simple image:tag — repository is 'redis' without tag",
+    v1["image"]["repository"] == "redis"))
+results.append(test("simple image:tag — tag is '7.2-alpine'",
+    v1["image"]["tag"] == "7.2-alpine"))
+
+# Case 2: Multi-component path with tag (e.g. myrepo/myapp:v1.2.3)
+app_img2 = AppConfig(name="my-app", image="registry.example.com/myteam/myapp:v1.2.3")
+v2 = build_values_yaml(app_img2, project_img, ({}, []))
+results.append(test("full path image:tag — repository correct",
+    v2["image"]["repository"] == "registry.example.com/myteam/myapp"))
+results.append(test("full path image:tag — tag is 'v1.2.3'",
+    v2["image"]["tag"] == "v1.2.3"))
+
+# Case 3: CLI --image-tag overrides embedded tag
+app_img3 = AppConfig(name="my-app2", image="redis:7.0")
+v3 = build_values_yaml(app_img3, project_img, ({}, []), image_tag="8.0-override")
+results.append(test("CLI --image-tag overrides embedded tag",
+    v3["image"]["tag"] == "8.0-override"))
+
+# Case 4: Plain image without tag — uses project image_tag
+app_img4 = AppConfig(name="my-svc", image="my-registry/my-svc")
+v4 = build_values_yaml(app_img4, project_img, ({}, []))
+results.append(test("plain image (no tag) — uses project image_tag 'latest'",
+    v4["image"]["tag"] == "latest"))
+
+
+# ===========================================================================
+# 14. BUG-2: Auto /tmp mount skipped when user explicitly mounts /tmp
+# ===========================================================================
+section("14. BUG-2 Fix — auto_mount_tmp dedup")
+
+project_tmp = ProjectDefinition(project="proj-tmp", image_tag="v1", apps=[])
+
+# Case 1: User has /tmp volume → auto-mount should be suppressed
+app_tmp = AppConfig(
+    name="app-tmp",
+    port=8080,
+    volumes=[
+        VolumeItem(name="ramdisk", mountPath="/tmp", emptyDir={"medium": "Memory"}),
+    ],
+)
+v_tmp = build_values_yaml(app_tmp, project_tmp, ({}, []))
+tmp_vols = [v for v in v_tmp["deployment"]["volumes"] if v.get("mountPath") == "/tmp"
+            or v.get("name") == "tmp"]
+tmp_mounts = [m for m in v_tmp["deployment"]["volumeMounts"] if m.get("mountPath") == "/tmp"]
+results.append(test("user-defined /tmp — no auto-generated 'tmp' volume added",
+    sum(1 for v in v_tmp["deployment"]["volumes"] if v.get("name") in ("tmp", "ramdisk")) == 1))
+results.append(test("user-defined /tmp — only one mount at /tmp",
+    len(tmp_mounts) == 1))
+results.append(test("user-defined /tmp — mount uses user's name 'ramdisk'",
+    tmp_mounts[0]["name"] == "ramdisk" if tmp_mounts else False))
+
+# Case 2: No user /tmp → auto-mount IS added
+app_notmp = AppConfig(name="app-notmp", port=8080)
+v_notmp = build_values_yaml(app_notmp, project_tmp, ({}, []))
+results.append(test("no user /tmp — auto 'tmp' volume is added",
+    any(v.get("name") == "tmp" and "emptyDir" in v for v in v_notmp["deployment"]["volumes"])))
+
+
+# ===========================================================================
+# 15. BUG-3: Port name collision — shorthand 'port:' + ports with name='http'
+# ===========================================================================
+section("15. BUG-3 Fix — Port name uniqueness")
+
+project_port = ProjectDefinition(project="proj-port", image_tag="v1", apps=[])
+
+# Case: shorthand port=8080 + user has ports=[{name: http, port: 9000}]
+app_port_coll = AppConfig(
+    name="app-port",
+    port=8080,  # shorthand
+    ports=[
+        ServicePort(name="http", port=9000),    # already uses 'http'
+        ServicePort(name="metrics", port=9100),
+    ],
+)
+v_port = build_values_yaml(app_port_coll, project_port, ({}, []))
+deploy_ports = v_port["deployment"]["ports"]
+port_names = [p["name"] for p in deploy_ports]
+results.append(test("port names are all unique (no duplicates)",
+    len(port_names) == len(set(port_names))))
+results.append(test("shorthand port 8080 inserted with name 'primary' (not 'http')",
+    any(p["name"] == "primary" and p["containerPort"] == 8080 for p in deploy_ports)))
+results.append(test("original http port 9000 still present",
+    any(p["name"] == "http" and p["containerPort"] == 9000 for p in deploy_ports)))
+
+
+# ===========================================================================
+# 16. LOGIC-1: storageClass="" must be rendered (not silently dropped)
+# ===========================================================================
+section("16. LOGIC-1 Fix — storageClass empty string preserved")
+
+# Empty string storageClass: K8s semantics = use a PV with no StorageClass
+pvc_empty_class = ProjectPVC(name="no-class-pvc", size="5Gi", storageClass="")
+yaml_out = build_project_pvcs_yaml([pvc_empty_class])
+results.append(test("storageClass='' renders storageClassName key in YAML",
+    "storageClassName" in yaml_out))
+results.append(test("storageClassName value is empty string",
+    'storageClassName: ""' in yaml_out or "storageClassName: ''" in yaml_out))
+
+# None (not set) → storageClassName should NOT be present
+pvc_no_class = ProjectPVC(name="default-class-pvc", size="5Gi")
+yaml_no = build_project_pvcs_yaml([pvc_no_class])
+results.append(test("storageClass=None → storageClassName absent from YAML",
+    "storageClassName" not in yaml_no))
+
+
+# ===========================================================================
+# 17. LOGIC-2: project-shared not created when only secret_keys exist (no config_pool)
+# ===========================================================================
+section("17. LOGIC-2 Fix — No empty ConfigMap generation logic")
+
+# Simulate: file has ONLY secret placeholders (config_pool={}, secret_keys=['X'])
+# build_values_yaml should NOT inject project configMapRef when config_pool empty
+project_l2b = ProjectDefinition(project="proj-l2b", image_tag="v1", apps=[])
+app_l2b = AppConfig(name="app-l2b", port=8080)
+
+# Only secrets, no config data
+values_secrets_only = build_values_yaml(app_l2b, project_l2b, ({}, ["VAULT_KEY"]))
+results.append(test("secretsOnly: no configMapRef in envFrom when config_pool={}",
+    not any("configMapRef" in e for e in values_secrets_only["deployment"]["envFrom"])))
+
+# Both config + secrets
+values_both = build_values_yaml(app_l2b, project_l2b, ({"APP_ENV": "prod"}, ["VAULT_KEY"]))
+results.append(test("config+secrets: configMapRef IS in envFrom when config_pool has data",
+    any(e.get("configMapRef", {}).get("name") == "proj-l2b-config"
+        for e in values_both["deployment"]["envFrom"])))
+
 
 # ===========================================================================
 # Summary

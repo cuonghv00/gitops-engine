@@ -614,8 +614,10 @@ def build_values_yaml(
     # 1. Resolve Ports
     all_ports = app.ports.copy()
     if app.port and not any(p.port == app.port for p in all_ports):
-        # Legacy single-port shorthand — prepend as primary port
-        all_ports.insert(0, ServicePort(name="http", port=app.port))
+        # BUG-3 FIX: ensure the shorthand name is unique (user may already have 'http' in ports)
+        existing_names = {p.name for p in all_ports}
+        shorthand_name = "http" if "http" not in existing_names else "primary"
+        all_ports.insert(0, ServicePort(name=shorthand_name, port=app.port))
     if not all_ports:
         # Absolute fallback — every deployment needs at least one port
         all_ports.append(ServicePort(name="http", port=80))
@@ -625,8 +627,23 @@ def build_values_yaml(
 
     # 2. Image logic
     image_repo = app.image_repo or project.image_repo or DEFAULT_REGISTRY
-    tag = image_tag or app.image_tag or project.image_tag
-    image_name = app.image if app.image else f"{image_repo}/{app.name}"
+
+    # BUG-1 FIX: Parse embedded tag from image URI before falling back to config.
+    # e.g. 'redis:7.2-alpine' or 'myrepo/myapp:v1.2' — split on last ':' in final segment.
+    if app.image:
+        last_segment = app.image.split("/")[-1]
+        if ":" in last_segment:
+            # URI contains an embedded tag — extract it
+            split_pos = app.image.rfind(":")
+            image_name = app.image[:split_pos]
+            # CLI --image-tag always overrides embedded tag; otherwise use embedded tag
+            tag = image_tag or app.image[split_pos + 1:]
+        else:
+            image_name = app.image
+            tag = image_tag or app.image_tag or project.image_tag
+    else:
+        image_name = f"{image_repo}/{app.name}"
+        tag = image_tag or app.image_tag or project.image_tag
 
     # Warn on non-deterministic 'latest' tag
     if tag == "latest":
@@ -646,8 +663,15 @@ def build_values_yaml(
     volumes: list = []
     volume_mounts: list = []
 
-    # Auto-mount /tmp emptyDir when readOnlyRootFilesystem is enabled
-    if sec_ctx.get("readOnlyRootFilesystem") and app.auto_mount_tmp:
+    # Auto-mount /tmp emptyDir when readOnlyRootFilesystem is enabled.
+    # BUG-2 FIX: Skip if user has explicitly defined a volume mounted at /tmp
+    # (user volumes processed later, so check VolumeItem list directly).
+    user_mounts_tmp = any(
+        (v.mountPath == "/tmp" if v.k8s is None else
+         v.k8s.get("mount", {}).get("mountPath") == "/tmp")
+        for v in app.volumes
+    )
+    if sec_ctx.get("readOnlyRootFilesystem") and app.auto_mount_tmp and not user_mounts_tmp:
         volumes.append({"name": "tmp", "emptyDir": {}})
         volume_mounts.append({"name": "tmp", "mountPath": "/tmp"})
 
@@ -819,7 +843,9 @@ def build_project_pvcs_yaml(pvcs: list[ProjectPVC]) -> str:
             "accessModes": pvc.accessModes,
             "resources": {"requests": {"storage": pvc.size}},
         }
-        if pvc.storageClass:
+        # LOGIC-1 FIX: Use 'is not None' — empty string "" is a valid K8s value meaning
+        # "no storage class" (forces PVC to match a PV without a class).
+        if pvc.storageClass is not None:
             spec["storageClassName"] = pvc.storageClass
         doc = {
             "apiVersion": "v1",
@@ -871,7 +897,9 @@ def main():
     print(f"=== GitOps Engine Generator ===\nProject: {project_def.project} | Env: {args.env}")
 
     # --- Generate project-shared chart ---
-    has_config = bool(config_pool) or bool(project_vars[1])
+    # LOGIC-2 FIX: project-shared only needed when there is ACTUAL config data or PVCs.
+    # secret_keys alone do NOT require a ConfigMap — they are Vault-injected into K8s Secrets.
+    has_config = bool(config_pool)   # True only when .env has non-secret key=value pairs
     has_pvcs = bool(project_def.pvcs)
     if has_config or has_pvcs:
         shared_dir = CHARTS_DIR / "project-shared"
@@ -889,6 +917,8 @@ def main():
             }
             write_yaml(shared_dir / "Chart.yaml", shared_chart, False)
 
+            # Only write ConfigMap when there is actual non-secret data.
+            # An empty ConfigMap causes unnecessary resource churn and confuses operators.
             if has_config:
                 cm = {
                     "apiVersion": "v1",
