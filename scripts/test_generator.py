@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+test_generator.py
+=================
+Validation tests for the refactored generator.py.
+Covers: ProjectPVC, EnvItem, VolumeItem, build_values_yaml output.
+"""
+import sys
+import yaml
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from scripts.generator import (
+    ProjectDefinition, AppConfig, EnvItem, VolumeItem, ProjectPVC,
+    build_values_yaml, build_env_items, build_volume_items,
+)
+
+PASS = "✅ PASS"
+FAIL = "❌ FAIL"
+
+
+def test(name: str, cond: bool, detail: str = "") -> bool:
+    status = PASS if cond else FAIL
+    msg = f"  {status}  {name}"
+    if not cond and detail:
+        msg += f"\n         → {detail}"
+    print(msg)
+    return cond
+
+
+def section(title: str):
+    print(f"\n{'─' * 60}")
+    print(f"  {title}")
+    print(f"{'─' * 60}")
+
+
+results = []
+
+# ===========================================================================
+# 1. EnvItem validation
+# ===========================================================================
+section("1. EnvItem — Validation")
+
+# Valid: plain value
+try:
+    e = EnvItem(name="LOG", value="debug")
+    results.append(test("plain name/value", e.name == "LOG"))
+except Exception as ex:
+    results.append(test("plain name/value", False, str(ex)))
+
+# Valid: secretEnv
+try:
+    e = EnvItem(secretEnv="my-secret", vars=["KEY1", "KEY2"])
+    results.append(test("secretEnv + vars", e.secretEnv == "my-secret" and e.vars == ["KEY1", "KEY2"]))
+except Exception as ex:
+    results.append(test("secretEnv + vars", False, str(ex)))
+
+# Valid: configMap envFrom
+try:
+    e = EnvItem(configMap="global-cfg")
+    results.append(test("configMap envFrom", e.configMap == "global-cfg"))
+except Exception as ex:
+    results.append(test("configMap envFrom", False, str(ex)))
+
+# Valid: secret envFrom
+try:
+    e = EnvItem(secret="api-keys")
+    results.append(test("secret envFrom", e.secret == "api-keys"))
+except Exception as ex:
+    results.append(test("secret envFrom", False, str(ex)))
+
+# Valid: raw
+try:
+    e = EnvItem(raw={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}})
+    results.append(test("raw env", "name" in e.raw))
+except Exception as ex:
+    results.append(test("raw env", False, str(ex)))
+
+# Invalid: multiple sources
+try:
+    e = EnvItem(name="X", configMap="Y")
+    results.append(test("multiple sources → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("multiple sources → should fail", True))
+
+# Invalid: secretEnv without vars
+try:
+    e = EnvItem(secretEnv="sec")
+    results.append(test("secretEnv without vars → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("secretEnv without vars → should fail", True))
+
+# Invalid: empty item
+try:
+    e = EnvItem()
+    results.append(test("empty EnvItem → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("empty EnvItem → should fail", True))
+
+
+# ===========================================================================
+# 2. build_env_items
+# ===========================================================================
+section("2. build_env_items — Output")
+
+envs = [
+    EnvItem(name="LOG_LEVEL", value="debug"),
+    EnvItem(secretEnv="proj-secret", vars=["DB_PASS", "API_KEY"]),
+    EnvItem(configMap="global-cm"),
+    EnvItem(secret="ext-secret"),
+    EnvItem(raw={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}),
+]
+env_list, env_from = build_env_items(envs)
+
+results.append(test("plain value in env_list", {"name": "LOG_LEVEL", "value": "debug"} in env_list))
+results.append(test("secretEnv → DB_PASS in env_list",
+    any(e.get("name") == "DB_PASS" and "secretKeyRef" in e.get("valueFrom", {}) for e in env_list)))
+results.append(test("secretEnv → API_KEY in env_list",
+    any(e.get("name") == "API_KEY" for e in env_list)))
+results.append(test("configMap → envFrom", {"configMapRef": {"name": "global-cm"}} in env_from))
+results.append(test("secret → envFrom", {"secretRef": {"name": "ext-secret"}} in env_from))
+results.append(test("raw env in env_list", any(e.get("name") == "POD_IP" for e in env_list)))
+
+
+# ===========================================================================
+# 3. VolumeItem validation
+# ===========================================================================
+section("3. VolumeItem — Validation")
+
+# Valid: pvc
+try:
+    v = VolumeItem(name="data", mountPath="/data", pvc="my-claim",
+                   readOnly=True, mountPropagation="None", recursiveReadOnly="Enabled")
+    results.append(test("pvc volume with mount options",
+        v.pvc == "my-claim" and v.readOnly is True and v.mountPropagation == "None"))
+except Exception as ex:
+    results.append(test("pvc volume with mount options", False, str(ex)))
+
+# Valid: emptyDir
+try:
+    v = VolumeItem(name="tmp", mountPath="/tmp", emptyDir={})
+    results.append(test("emptyDir: {}", v.emptyDir == {}))
+except Exception as ex:
+    results.append(test("emptyDir: {}", False, str(ex)))
+
+# Valid: emptyDir with options
+try:
+    v = VolumeItem(name="mem", mountPath="/cache", emptyDir={"medium": "Memory"})
+    results.append(test("emptyDir with medium", v.emptyDir["medium"] == "Memory"))
+except Exception as ex:
+    results.append(test("emptyDir with medium", False, str(ex)))
+
+# Valid: hostPath string shorthand
+try:
+    v = VolumeItem(name="logs", mountPath="/var/log", hostPath="/var/log/nodes")
+    results.append(test("hostPath string shorthand", v.hostPath == "/var/log/nodes"))
+except Exception as ex:
+    results.append(test("hostPath string shorthand", False, str(ex)))
+
+# Valid: configMap string shorthand
+try:
+    v = VolumeItem(name="cfg", mountPath="/etc/cfg", configMap="my-cm")
+    results.append(test("configMap string shorthand", v.configMap == "my-cm"))
+except Exception as ex:
+    results.append(test("configMap string shorthand", False, str(ex)))
+
+# Valid: configMap full spec
+try:
+    v = VolumeItem(name="cfg2", mountPath="/etc/cfg2",
+                   configMap={"name": "my-cm", "items": [{"key": "a", "path": "a"}]})
+    results.append(test("configMap full spec dict", isinstance(v.configMap, dict)))
+except Exception as ex:
+    results.append(test("configMap full spec dict", False, str(ex)))
+
+# Valid: secret string shorthand
+try:
+    v = VolumeItem(name="certs", mountPath="/certs", secret="tls-cert")
+    results.append(test("secret string shorthand", v.secret == "tls-cert"))
+except Exception as ex:
+    results.append(test("secret string shorthand", False, str(ex)))
+
+# Valid: secret full spec
+try:
+    v = VolumeItem(name="certs2", mountPath="/certs2",
+                   secret={"secretName": "tls-cert", "items": [{"key": "tls.crt", "path": "tls.crt"}]})
+    results.append(test("secret full spec dict", isinstance(v.secret, dict)))
+except Exception as ex:
+    results.append(test("secret full spec dict", False, str(ex)))
+
+# Valid: raw
+try:
+    v = VolumeItem(raw={
+        "volume": {"name": "nfs", "nfs": {"server": "nfs.example.com", "path": "/exports"}},
+        "mount": {"mountPath": "/mnt/nfs", "readOnly": True},
+    })
+    results.append(test("raw volume", "volume" in v.raw))
+except Exception as ex:
+    results.append(test("raw volume", False, str(ex)))
+
+# Invalid: multiple sources
+try:
+    v = VolumeItem(name="x", mountPath="/x", pvc="y", emptyDir={})
+    results.append(test("multiple sources → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("multiple sources → should fail", True))
+
+# Invalid: no source
+try:
+    v = VolumeItem(name="x", mountPath="/x")
+    results.append(test("no source → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("no source → should fail", True))
+
+
+# ===========================================================================
+# 4. build_volume_items
+# ===========================================================================
+section("4. build_volume_items — Output")
+
+volumes = [
+    VolumeItem(name="data", mountPath="/data", pvc="my-pvc", readOnly=True, mountPropagation="None"),
+    VolumeItem(name="cache", mountPath="/cache", emptyDir={}),
+    VolumeItem(name="logs", mountPath="/var/log", hostPath="/var/log/nodes"),
+    VolumeItem(name="cfg", mountPath="/etc/app", configMap="my-cm"),
+    VolumeItem(name="certs", mountPath="/certs", secret="tls-secret"),
+    VolumeItem(raw={
+        "volume": {"name": "nfs", "nfs": {"server": "nfs.example.com", "path": "/exports"}},
+        "mount": {"mountPath": "/mnt/nfs"},
+    }),
+]
+vol_specs, mount_specs = build_volume_items(volumes)
+
+results.append(test("pvc → persistentVolumeClaim",
+    any(v.get("persistentVolumeClaim", {}).get("claimName") == "my-pvc" for v in vol_specs)))
+results.append(test("pvc mount → readOnly=True",
+    any(m.get("name") == "data" and m.get("readOnly") is True for m in mount_specs)))
+results.append(test("pvc mount → mountPropagation=None",
+    any(m.get("name") == "data" and m.get("mountPropagation") == "None" for m in mount_specs)))
+results.append(test("emptyDir → {}",
+    any("emptyDir" in v and v["name"] == "cache" for v in vol_specs)))
+results.append(test("hostPath string → dict",
+    any(v.get("hostPath", {}).get("path") == "/var/log/nodes" for v in vol_specs)))
+results.append(test("configMap string → {name: cm}",
+    any(v.get("configMap", {}).get("name") == "my-cm" for v in vol_specs)))
+results.append(test("secret string → {secretName: ...}",
+    any(v.get("secret", {}).get("secretName") == "tls-secret" for v in vol_specs)))
+results.append(test("raw volume preserved",
+    any(v.get("name") == "nfs" and "nfs" in v for v in vol_specs)))
+results.append(test("raw mount has name from volume",
+    any(m.get("name") == "nfs" for m in mount_specs)))
+
+
+# ===========================================================================
+# 5. ProjectDefinition with pvcs
+# ===========================================================================
+section("5. ProjectDefinition — pvcs field")
+
+pd = ProjectDefinition(
+    project="test-project",
+    pvcs=[
+        {"name": "shared-storage", "size": "50Gi", "storageClass": "nfs-client"},
+        {"name": "db-data", "size": "20Gi"},
+    ],
+    apps=[],
+)
+results.append(test("pvcs parsed", len(pd.pvcs) == 2))
+results.append(test("pvc name", pd.pvcs[0].name == "shared-storage"))
+results.append(test("pvc storageClass", pd.pvcs[0].storageClass == "nfs-client"))
+results.append(test("pvc default accessModes", pd.pvcs[1].accessModes == ["ReadWriteOnce"]))
+
+
+# ===========================================================================
+# 6. Full build_values_yaml integration
+# ===========================================================================
+section("6. build_values_yaml — Integration")
+
+project = ProjectDefinition(
+    project="test-proj",
+    image_repo="registry.vn/test",
+    image_tag="v1.0",
+    pvcs=[{"name": "shared-pvc", "size": "10Gi"}],
+    apps=[],
+)
+app = AppConfig(
+    name="my-app",
+    port=8080,
+    envs=[
+        EnvItem(name="ENV", value="prod"),
+        EnvItem(secretEnv="test-proj-secret", vars=["DB_PASS"]),
+        EnvItem(configMap="extra-cfg"),
+        EnvItem(secret="extra-sec"),
+    ],
+    volumes=[
+        VolumeItem(name="data", mountPath="/data", pvc="shared-pvc", readOnly=True),
+        VolumeItem(name="cache", mountPath="/tmp/cache", emptyDir={}),
+    ],
+)
+
+values = build_values_yaml(app, project, ({}, []))
+
+# Check env
+env = values["deployment"]["env"]
+results.append(test("plain ENV value in env", any(e.get("name") == "ENV" and e.get("value") == "prod" for e in env)))
+results.append(test("secretEnv DB_PASS in env via secretKeyRef",
+    any(e.get("name") == "DB_PASS" and "secretKeyRef" in e.get("valueFrom", {}) for e in env)))
+
+# Check envFrom
+env_from = values["deployment"]["envFrom"]
+results.append(test("default project configMapRef in envFrom",
+    any(e.get("configMapRef", {}).get("name") == "test-proj-config" for e in env_from)))
+results.append(test("extra configMap in envFrom",
+    any(e.get("configMapRef", {}).get("name") == "extra-cfg" for e in env_from)))
+results.append(test("extra secret in envFrom",
+    any(e.get("secretRef", {}).get("name") == "extra-sec" for e in env_from)))
+
+# Check volumes
+vol_specs = values["deployment"]["volumes"]
+mount_specs = values["deployment"]["volumeMounts"]
+results.append(test("auto /tmp emptyDir volume present",
+    any(v.get("name") == "tmp" for v in vol_specs)))
+results.append(test("pvc volume ref",
+    any(v.get("persistentVolumeClaim", {}).get("claimName") == "shared-pvc" for v in vol_specs)))
+results.append(test("pvc mount readOnly=True",
+    any(m.get("name") == "data" and m.get("readOnly") is True for m in mount_specs)))
+results.append(test("emptyDir cache volume",
+    any("emptyDir" in v and v.get("name") == "cache" for v in vol_specs)))
+
+# Check image
+results.append(test("image repository", values["image"]["repository"] == "registry.vn/test/my-app"))
+results.append(test("image tag", values["image"]["tag"] == "v1.0"))
+
+# ===========================================================================
+# Summary
+# ===========================================================================
+section("Summary")
+passed = sum(results)
+total = len(results)
+print(f"\n  {passed}/{total} tests passed")
+if passed == total:
+    print("  🎉 All tests passed!")
+else:
+    print(f"  ⚠️  {total - passed} test(s) failed.")
+sys.exit(0 if passed == total else 1)

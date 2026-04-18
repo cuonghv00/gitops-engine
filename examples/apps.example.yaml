@@ -4,37 +4,81 @@
 # Use this as a template for your project configuration.
 # ==============================================================================
 
-project: "example-project"        # Project name (used for labels and namespaces)
-common_version: "1.0.0"           # Version of 'common-lib' to use
-image_repo: "registry.vn/example" # Default registry for all apps in this project
-image_tag: "v1.0.0"               # Default image tag if not specified in app
+project: "example-project"
+common_version: "1.0.0"
+image_repo: "registry.vn/example"
+image_tag: "v1.0.0"
 
-# Global Pull Secrets for the whole project
 imagePullSecrets:
   - name: "regcred-global"
+
+# ------------------------------------------------------------------------------
+# Project-level PVCs — lifecycle managed INDEPENDENTLY from app charts.
+# Reference them in app volumes via `pvc: <name>`.
+# ------------------------------------------------------------------------------
+pvcs:
+  - name: "shared-storage"
+    size: "50Gi"
+    storageClass: "nfs-client"
+    accessModes:
+      - ReadWriteMany
+
+  - name: "db-data"
+    size: "20Gi"
+    storageClass: "fast-ssd"
 
 apps:
   # ----------------------------------------------------------------------------
   # CASE 1: Simple Web Service
   # ----------------------------------------------------------------------------
   - name: "web-portal"
-    port: 80                      # Container port
+    port: 80
     replicas: 2
     ingress:
       enabled: true
-      host: "portal.example.com"  # Simplified single host setup
+      host: "portal.example.com"
     health:
-      enabled: true               # Default liveness/readiness on '/' (HTTP)
+      enabled: true
 
   # ----------------------------------------------------------------------------
-  # CASE 2: API Service with custom logic
+  # CASE 2: Flattened Envs — all env declaration styles
   # ----------------------------------------------------------------------------
   - name: "backend-api"
-    type: "deployment"            # Default type
     port: 3000
     service:
-      enabled: true
-      port: 80                    # External service port mapping to 3000
+      port: 80           # Service port 80 → container port 3000
+
+    envs:
+      # Style 1: Plain value
+      - name: LOG_LEVEL
+        value: "debug"
+
+      # Style 2: Per-key secretKeyRef (Vault-synced secret → K8s Secret)
+      # Injects each key as its own env var via secretKeyRef
+      - secretEnv: example-project-secret
+        vars:
+          - DATABASE_URL
+          - API_KEY
+
+      # Style 3: Inject all keys from a ConfigMap via envFrom
+      - configMap: global-feature-flags
+
+      # Style 4: Inject all keys from a Secret via envFrom
+      - secret: external-api-keys
+
+      # Style 5: Raw K8s EnvVar spec (escape hatch for complex cases)
+      - raw:
+          name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+
+      - raw:
+          name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
     resources:
       limits:
         cpu: "500m"
@@ -42,37 +86,147 @@ apps:
       requests:
         cpu: "100m"
         memory: "128Mi"
-    # Environment variables
-    env_vars:
-      - DATABASE_URL              # Fetched from apps.env.env (ConfigMap)
-      - API_KEY                   # Fetched from HashiCorp Vault (Secret)
-    env:
-      - name: LOG_LEVEL
-        value: "debug"
 
   # ----------------------------------------------------------------------------
-  # CASE 3: Stateful Service (Redis/Database Proxy)
+  # CASE 3: Flattened Volumes — all volume source types + mount options
+  # ----------------------------------------------------------------------------
+  - name: "data-processor"
+    port: 8080
+
+    volumes:
+      # PVC reference (must be declared in project pvcs: above)
+      - name: shared-data
+        mountPath: /mnt/shared
+        pvc: shared-storage
+        readOnly: true
+        mountPropagation: None
+
+      # Read-write PVC
+      - name: db-storage
+        mountPath: /var/lib/db
+        pvc: db-data
+
+      # EmptyDir (in-memory)
+      - name: memory-cache
+        mountPath: /tmp/cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: "256Mi"
+
+      # EmptyDir (default disk-backed)
+      - name: work-dir
+        mountPath: /tmp/work
+        emptyDir: {}
+
+      # HostPath — access node filesystem
+      - name: host-logs
+        mountPath: /var/log/app
+        hostPath:
+          path: /var/log/nodes
+          type: DirectoryOrCreate
+
+      # ConfigMap mounted as directory of files
+      - name: app-config
+        mountPath: /etc/config
+        configMap:
+          name: special-config
+          items:
+            - key: settings.json
+              path: settings.json
+
+      # ConfigMap shorthand (mount entire CM as directory)
+      - name: nginx-conf
+        mountPath: /etc/nginx/conf.d
+        configMap: nginx-config
+
+      # Secret mounted as files (e.g. TLS certs, SSH keys)
+      - name: tls-certs
+        mountPath: /etc/ssl/certs
+        readOnly: true
+        secret:
+          secretName: tls-cert
+          items:
+            - key: tls.crt
+              path: tls.crt
+            - key: tls.key
+              path: tls.key
+
+      # Secret shorthand
+      - name: api-token
+        mountPath: /run/secrets/token
+        secret: api-token-secret
+
+      # Raw — full K8s Volume + VolumeMount spec (escape hatch)
+      - raw:
+          volume:
+            name: nfs-archive
+            nfs:
+              server: nfs.example.com
+              path: /exports/archive
+          mount:
+            mountPath: /mnt/archive
+            readOnly: true
+
+  # ----------------------------------------------------------------------------
+  # CASE 4: Stateful Service (legacy pvc field — still works for simple cases)
   # ----------------------------------------------------------------------------
   - name: "redis-cache"
     port: 6379
     health:
       enabled: true
-      # No 'path' defined + port 6379 -> Generator auto-sets tcpSocket check
     pvc:
       enabled: true
       size: "20Gi"
       storageClass: "fast-storage"
       mountPath: "/data"
     securityContext:
-      runAsUser: 999              # Override default security settings
-      readOnlyRootFilesystem: false # Disable R/O for legacy apps
+      runAsUser: 999
+      readOnlyRootFilesystem: false
 
   # ----------------------------------------------------------------------------
-  # CASE 4: Advanced Networking (Multiple Ingress Paths)
+  # CASE 5: Multi-Port Service with RBAC + combined env sources
   # ----------------------------------------------------------------------------
-  - name: "admin-panel"
+  - name: "order-service"
+    ports:
+      - name: http
+        port: 80
+        targetPort: 8080
+      - name: grpc
+        port: 50051
+        targetPort: 50051
+    serviceAccount:
+      create: true
+      automountToken: false
+
+    envs:
+      - name: ENV
+        value: "production"
+      - secretEnv: order-service-secret
+        vars:
+          - DB_PASSWORD
+          - STRIPE_SECRET
+      - configMap: global-config
+
     ingress:
       enabled: true
+      host: "orders.example.com"
+      servicePort: "http"
+    health:
+      enabled: true
+      liveness: "/health"
+      readiness: "/ready"
+
+  # ----------------------------------------------------------------------------
+  # CASE 6: Advanced Ingress — Multiple hosts/paths + annotations
+  # ----------------------------------------------------------------------------
+  - name: "admin-panel"
+    port: 3000
+    ingress:
+      enabled: true
+      className: "nginx"
+      annotations:
+        nginx.ingress.kubernetes.io/ssl-redirect: "true"
+        nginx.ingress.kubernetes.io/proxy-body-size: "50m"
       hosts:
         - host: "admin.example.com"
           paths:
@@ -80,17 +234,3 @@ apps:
               pathType: "Prefix"
             - path: "/static"
               pathType: "ImplementationSpecific"
-      annotations:
-        nginx.ingress.kubernetes.io/ssl-redirect: "true"
-
-  # ----------------------------------------------------------------------------
-  # CASE 5: Custom Health Checks (gRPC or Specific Paths)
-  # ----------------------------------------------------------------------------
-  - name: "auth-service"
-    health:
-      enabled: true
-      liveness: "/live"           # Short-form HTTP path
-      readiness:
-        path: "/ready"            # Long-form with parameters
-        initialDelaySeconds: 30
-        failureThreshold: 5
