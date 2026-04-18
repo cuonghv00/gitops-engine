@@ -13,10 +13,11 @@ Design principle: IDEMPOTENT — safe to run multiple times without side effects
 """
 
 import argparse
-import sys
+import os
 import re
+import sys
 from pathlib import Path
-from typing import Optional, Union, Any
+from typing import Optional, Union
 
 import yaml
 from pydantic import BaseModel, Field, ConfigDict, model_validator
@@ -26,7 +27,47 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 # ---------------------------------------------------------------------------
 DEFAULT_REGISTRY = "registry.vn/platform"
 DEFAULT_PULL_SECRET = "regcred"
-COMMON_LIB_REL_PATH = "../../../../../helm-templates/common-lib"
+
+REPO_ROOT = Path(__file__).parent.parent
+COMMON_LIB_PATH = REPO_ROOT / "helm-templates" / "common-lib"
+
+# Default Nginx Ingress annotations — merged with user-provided annotations.
+# User values override these defaults.
+_NGINX_DEFAULT_ANNOTATIONS: dict[str, str] = {
+    "nginx.ingress.kubernetes.io/ssl-redirect": "false",
+    "nginx.ingress.kubernetes.io/proxy-body-size": "8m",
+}
+
+# ---------------------------------------------------------------------------
+# Validation Helpers
+# ---------------------------------------------------------------------------
+
+# K8s names: lowercase alphanumeric and dashes, must start/end with alphanumeric
+_K8S_NAME_RE = re.compile(r'^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$')
+
+
+def _validate_k8s_name(name: str, label: str = "name") -> str:
+    """Validate a name conforms to Kubernetes DNS naming rules.
+
+    Rules: lowercase, alphanumeric and dashes, must start and end with alphanumeric.
+    Max 63 chars (Helm truncates anyway, but good to catch early).
+    """
+    if not name:
+        raise ValueError(f"{label} cannot be empty")
+    if len(name) > 63:
+        raise ValueError(f"{label} '{name}' exceeds 63 characters (len={len(name)})")
+    if not _K8S_NAME_RE.match(name):
+        raise ValueError(
+            f"{label} '{name}' is not a valid Kubernetes name. "
+            "Must be lowercase alphanumeric with dashes, e.g. 'my-app'."
+        )
+    return name
+
+
+def _get_common_lib_rel_path(from_dir: Path) -> str:
+    """Compute the relative path from a chart directory to the common-lib chart."""
+    return os.path.relpath(COMMON_LIB_PATH, from_dir)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic Models for Configuration Validation
@@ -49,11 +90,12 @@ class IngressConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
     enabled: bool = False
     host: Optional[str] = None
-    path: Optional[str] = None  # Shortcut
+    path: Optional[str] = None  # Shortcut for single-path config
     hosts: Optional[list[IngressHost]] = None
     servicePort: Optional[Union[int, str]] = None
     annotations: dict[str, str] = Field(default_factory=dict)
     className: str = "nginx"
+    tls: Optional[list[dict]] = None
 
 
 class ProbeConfig(BaseModel):
@@ -91,12 +133,17 @@ class PVCConfig(BaseModel):
 
 
 class ProjectPVC(BaseModel):
-    """Project-level PVC definition. Managed independently in project-shared chart."""
+    """Project-level PVC — lifecycle managed independently in project-shared chart."""
     model_config = ConfigDict(extra='forbid')
     name: str
     size: str = "10Gi"
     storageClass: Optional[str] = None
     accessModes: list[str] = Field(default_factory=lambda: ["ReadWriteOnce"])
+
+    @model_validator(mode='after')
+    def validate_name(self) -> 'ProjectPVC':
+        _validate_k8s_name(self.name, "ProjectPVC.name")
+        return self
 
 
 class ServicePort(BaseModel):
@@ -112,15 +159,15 @@ class ServiceAccountConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
     create: bool = True
     automountToken: bool = False  # Hardened default (RBAC Security)
-    name: Optional[str] = None
+    name: Optional[str] = None   # If set, overrides the auto-generated fullname
 
 
 class ServiceConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
     enabled: bool = True
     type: str = "ClusterIP"
-    port: Optional[int] = None  # Shortcut
-    targetPort: Optional[int] = None  # Shortcut
+    port: Optional[int] = None       # Shortcut: single-port service
+    targetPort: Optional[int] = None # Shortcut: maps to container targetPort
     ports: list[ServicePort] = Field(default_factory=list)
     annotations: dict[str, str] = Field(default_factory=dict)
 
@@ -134,7 +181,7 @@ class EnvItem(BaseModel):
       Per-key secret: secretEnv: secret-name, vars: [KEY1, KEY2]
       envFrom CM:     configMap: configmap-name
       envFrom Secret: secret: secret-name
-      Native K8s:     k8s: {name: ..., valueFrom: ...}  # Full K8s EnvVar spec
+      Native K8s:     k8s: {name: ..., valueFrom: ...}  # Downward API, resourceFieldRef, etc.
     """
     model_config = ConfigDict(extra='forbid')
 
@@ -186,7 +233,10 @@ class VolumeItem(BaseModel):
     Mount options (readOnly, mountPropagation, recursiveReadOnly) are
     applied to the VolumeMount spec.
 
-    For native K8s manifest (escape hatch), use:
+    NOTE: emptyDir: {} is a valid empty dict (falsy in Python!) — always use
+    'is not None' checks, never 'if item.emptyDir'.
+
+    For native K8s manifest (escape hatch for NFS, CSI, Projected, etc.):
       k8s:
         volume: {name: ..., <source_spec>: ...}
         mount:  {mountPath: ..., ...}
@@ -202,7 +252,7 @@ class VolumeItem(BaseModel):
 
     # Volume sources (exactly one must be set)
     pvc: Optional[str] = None                       # claimName
-    emptyDir: Optional[dict] = None                 # {} or {medium: Memory}
+    emptyDir: Optional[dict] = None                 # {} or {medium: Memory}  ← may be falsy!
     hostPath: Optional[Union[str, dict]] = None     # "/path" or {path:, type:}
     configMap: Optional[Union[str, dict]] = None    # "cm-name" or {name:, items:}
     secret: Optional[Union[str, dict]] = None       # "sec-name" or {secretName:, items:}
@@ -210,9 +260,10 @@ class VolumeItem(BaseModel):
 
     @model_validator(mode='after')
     def validate_source(self) -> 'VolumeItem':
+        # NOTE: emptyDir may be {} (falsy), use 'is not None' throughout
         sources = sum([
             self.pvc is not None,
-            self.emptyDir is not None,
+            self.emptyDir is not None,   # {} is valid — do NOT use `bool(self.emptyDir)`
             self.hostPath is not None,
             self.configMap is not None,
             self.secret is not None,
@@ -261,7 +312,7 @@ class AppConfig(BaseModel):
     env: list[dict] = Field(default_factory=list)
     env_vars: list[str] = Field(default_factory=list)
     envFrom: list[dict] = Field(default_factory=list)
-    mount_env_file: bool = False  # DEPRECATED: use volumes with configMap instead
+    mount_env_file: bool = False  # DEPRECATED: use volumes with configMap source
     pvc: PVCConfig = Field(default_factory=PVCConfig)  # DEPRECATED: use project pvcs + volumes
 
     service: Optional[Union[bool, ServiceConfig]] = None
@@ -272,18 +323,30 @@ class AppConfig(BaseModel):
     strategy: str = "RollingUpdate"
     affinity: dict = Field(default_factory=dict)
     tolerations: list = Field(default_factory=list)
-    serviceAccountName: Optional[str] = None  # Deprecated: prefer serviceAccount.name
+    serviceAccountName: Optional[str] = None  # DEPRECATED: prefer serviceAccount.name
     genConfigMaps: bool = False
     podAnnotations: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode='after')
-    def validate_ports_uniqueness(self) -> 'AppConfig':
+    def validate_app(self) -> 'AppConfig':
+        # Validate K8s-compatible name
+        _validate_k8s_name(self.name, "App name")
+
+        # Validate port uniqueness across multi-port definitions
         names = [p.name for p in self.ports]
         if len(names) != len(set(names)):
-            raise ValueError(f"Duplicate port names detected in app '{self.name}': {names}")
-        ports = [p.port for p in self.ports]
-        if len(ports) != len(set(ports)):
-            raise ValueError(f"Duplicate port numbers detected in app '{self.name}': {ports}")
+            raise ValueError(f"Duplicate port names in app '{self.name}': {names}")
+        port_nums = [p.port for p in self.ports]
+        if len(port_nums) != len(set(port_nums)):
+            raise ValueError(f"Duplicate port numbers in app '{self.name}': {port_nums}")
+
+        # Validate ingress + service compatibility upfront
+        if self.ingress.enabled and self.service is False:
+            raise ValueError(
+                f"App '{self.name}': ingress.enabled=true requires a Service backend. "
+                "Remove 'service: false' or disable the ingress."
+            )
+
         return self
 
 
@@ -298,21 +361,28 @@ class ProjectDefinition(BaseModel):
     pvcs: list[ProjectPVC] = Field(default_factory=list)
     apps: list[AppConfig] = Field(default_factory=list)
 
+    @model_validator(mode='after')
+    def validate_project(self) -> 'ProjectDefinition':
+        _validate_k8s_name(self.project, "Project name")
+        return self
+
 
 # ---------------------------------------------------------------------------
 # File Utilities
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).parent.parent
-COMMON_LIB_PATH = REPO_ROOT / "helm-templates" / "common-lib"
-
-
 def parse_env_file(env_path: Path) -> tuple[dict, list]:
-    config_data = {}
-    secret_keys = []
+    """Parse an .env file into (config_data, secret_keys).
+
+    config_data: key=value pairs with literal values → becomes ConfigMap data.
+    secret_keys: keys with ${...} placeholder values → expected in K8s Secret.
+    """
+    config_data: dict = {}
+    secret_keys: list = []
     if not env_path.exists():
         return config_data, secret_keys
-    pattern = re.compile(r"^\s*([\w.-]+)\s*=\s*(.*)\s*$")
+
+    pattern = re.compile(r"^\s*([\w.-]+)\s*=\s*(.*?)\s*$")
     with env_path.open() as f:
         for line in f:
             line = line.strip()
@@ -321,7 +391,12 @@ def parse_env_file(env_path: Path) -> tuple[dict, list]:
             match = pattern.match(line)
             if match:
                 key, value = match.groups()
-                value = value.strip("'\"")
+                # Strip matching outer quotes only (prevent stripping inner quotes)
+                if len(value) >= 2 and (
+                    (value[0] == '"' and value[-1] == '"')
+                    or (value[0] == "'" and value[-1] == "'")
+                ):
+                    value = value[1:-1]
                 if value.startswith("${") and value.endswith("}"):
                     secret_keys.append(key)
                 else:
@@ -347,19 +422,74 @@ def ensure_dir(path: Path, dry_run: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Probe Builder (module-level to avoid closure capture issues)
+# ---------------------------------------------------------------------------
+
+def _build_probe(
+    cfg_union: Union[str, ProbeConfig, None],
+    health_cfg: HealthConfig,
+    default_port: Union[int, str],
+) -> dict:
+    """Build a K8s probe dict from a flexible probe configuration.
+
+    Args:
+        cfg_union:    None (use health defaults), str (HTTP path), or ProbeConfig.
+        health_cfg:   The parent HealthConfig for fallback path/port/timing defaults.
+        default_port: The container's primary port, used when no port is explicitly set.
+    """
+    if cfg_union is None:
+        # Use parent HealthConfig as the probe spec
+        path = health_cfg.path
+        port = health_cfg.port or default_port
+        init_delay = health_cfg.initialDelaySeconds
+        period = health_cfg.periodSeconds
+        timeout = health_cfg.timeoutSeconds
+        failure = health_cfg.failureThreshold
+
+    elif isinstance(cfg_union, str):
+        # Short-form: just an HTTP path string
+        path = cfg_union
+        port = health_cfg.port or default_port
+        init_delay = health_cfg.initialDelaySeconds
+        period = health_cfg.periodSeconds
+        timeout = health_cfg.timeoutSeconds
+        failure = health_cfg.failureThreshold
+
+    else:
+        # Full ProbeConfig — use its values, falling back to health_cfg for missing fields
+        path = cfg_union.path or health_cfg.path
+        port = cfg_union.port or health_cfg.port or default_port
+        init_delay = cfg_union.initialDelaySeconds
+        period = cfg_union.periodSeconds
+        timeout = cfg_union.timeoutSeconds
+        failure = cfg_union.failureThreshold
+
+    res: dict = {
+        "initialDelaySeconds": init_delay,
+        "periodSeconds": period,
+        "timeoutSeconds": timeout,
+        "failureThreshold": failure,
+    }
+    if path:
+        res["httpGet"] = {"path": path, "port": port}
+    else:
+        res["tcpSocket"] = {"port": port}
+    return res
+
+
+# ---------------------------------------------------------------------------
 # Env & Volume Builders
 # ---------------------------------------------------------------------------
 
 def build_env_items(envs: list[EnvItem]) -> tuple[list, list]:
-    """
-    Parse a list of EnvItem into (env_list, env_from_list) for K8s.
+    """Parse a list of EnvItem into (env_list, env_from_list) for K8s.
 
     Returns:
         env_list:      List of K8s EnvVar dicts → container.env
         env_from_list: List of K8s EnvFromSource dicts → container.envFrom
     """
-    env_list = []
-    env_from_list = []
+    env_list: list = []
+    env_from_list: list = []
 
     for item in envs:
         if item.k8s is not None:
@@ -367,7 +497,7 @@ def build_env_items(envs: list[EnvItem]) -> tuple[list, list]:
             env_list.append(item.k8s)
 
         elif item.secretEnv is not None:
-            # Per-key secretKeyRef injection
+            # Per-key secretKeyRef — inject each var individually
             for key in (item.vars or []):
                 env_list.append({
                     "name": key,
@@ -380,11 +510,11 @@ def build_env_items(envs: list[EnvItem]) -> tuple[list, list]:
                 })
 
         elif item.configMap is not None:
-            # envFrom configMapRef
+            # envFrom configMapRef — inject all keys from a ConfigMap
             env_from_list.append({"configMapRef": {"name": item.configMap}})
 
         elif item.secret is not None:
-            # envFrom secretRef
+            # envFrom secretRef — inject all keys from a Secret
             env_from_list.append({"secretRef": {"name": item.secret}})
 
         elif item.name is not None:
@@ -398,19 +528,20 @@ def build_env_items(envs: list[EnvItem]) -> tuple[list, list]:
 
 
 def build_volume_items(volumes: list[VolumeItem]) -> tuple[list, list]:
-    """
-    Parse a list of VolumeItem into (volume_specs, volume_mount_specs) for K8s.
+    """Parse a list of VolumeItem into (volume_specs, volume_mount_specs) for K8s.
 
     Returns:
         volume_specs:       List of K8s Volume dicts → pod.spec.volumes
         volume_mount_specs: List of K8s VolumeMount dicts → container.volumeMounts
+
+    IMPORTANT: emptyDir may be {} (falsy in Python). Always use 'is not None' for checks.
     """
-    volume_specs = []
-    mount_specs = []
+    volume_specs: list = []
+    mount_specs: list = []
 
     for item in volumes:
         if item.k8s is not None:
-            # Native K8s Volume + VolumeMount spec (NFS, CSI, projected, etc.)
+            # Native K8s Volume + VolumeMount spec (NFS, CSI, Projected, etc.)
             k8s_vol = dict(item.k8s.get("volume", {}))
             k8s_mount = dict(item.k8s.get("mount", {}))
             if not k8s_vol:
@@ -437,26 +568,29 @@ def build_volume_items(volumes: list[VolumeItem]) -> tuple[list, list]:
         if item.pvc is not None:
             vol["persistentVolumeClaim"] = {"claimName": item.pvc}
 
-        elif item.emptyDir is not None:
-            vol["emptyDir"] = item.emptyDir  # may be {}
+        elif item.emptyDir is not None:  # NOTE: {} is valid, use 'is not None'
+            vol["emptyDir"] = item.emptyDir
 
         elif item.hostPath is not None:
-            if isinstance(item.hostPath, str):
-                vol["hostPath"] = {"path": item.hostPath}
-            else:
-                vol["hostPath"] = dict(item.hostPath)
+            vol["hostPath"] = (
+                {"path": item.hostPath}
+                if isinstance(item.hostPath, str)
+                else dict(item.hostPath)
+            )
 
         elif item.configMap is not None:
-            if isinstance(item.configMap, str):
-                vol["configMap"] = {"name": item.configMap}
-            else:
-                vol["configMap"] = dict(item.configMap)
+            vol["configMap"] = (
+                {"name": item.configMap}
+                if isinstance(item.configMap, str)
+                else dict(item.configMap)
+            )
 
         elif item.secret is not None:
-            if isinstance(item.secret, str):
-                vol["secret"] = {"secretName": item.secret}
-            else:
-                vol["secret"] = dict(item.secret)
+            vol["secret"] = (
+                {"secretName": item.secret}
+                if isinstance(item.secret, str)
+                else dict(item.secret)
+            )
 
         volume_specs.append(vol)
         mount_specs.append(vm)
@@ -480,8 +614,10 @@ def build_values_yaml(
     # 1. Resolve Ports
     all_ports = app.ports.copy()
     if app.port and not any(p.port == app.port for p in all_ports):
+        # Legacy single-port shorthand — prepend as primary port
         all_ports.insert(0, ServicePort(name="http", port=app.port))
     if not all_ports:
+        # Absolute fallback — every deployment needs at least one port
         all_ports.append(ServicePort(name="http", port=80))
 
     primary_svc_port = all_ports[0].port
@@ -492,8 +628,15 @@ def build_values_yaml(
     tag = image_tag or app.image_tag or project.image_tag
     image_name = app.image if app.image else f"{image_repo}/{app.name}"
 
-    # 3. Security & Base Volumes
-    default_sec_ctx = {
+    # Warn on non-deterministic 'latest' tag
+    if tag == "latest":
+        print(
+            f"  [WARN] App '{app.name}' uses image tag 'latest' — "
+            "consider pinning to a specific version for reproducible deployments."
+        )
+
+    # 3. Security Context & Base Volumes
+    default_sec_ctx: dict = {
         "readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False,
         "runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000,
         "capabilities": {"drop": ["ALL"]}
@@ -513,7 +656,7 @@ def build_values_yaml(
         volumes.append({"name": "env-file", "configMap": {"name": f"{project_name}-config"}})
         volume_mounts.append({"name": "env-file", "mountPath": "/app/.env", "subPath": ".env"})
 
-    # 5. [DEPRECATED] Legacy per-app pvc
+    # 5. [DEPRECATED] Legacy per-app pvc (creates PVC inside app chart)
     if app.pvc.enabled and app.pvc.mountPath:
         volumes.append({
             "name": "data-volume",
@@ -529,36 +672,21 @@ def build_values_yaml(
     # 7. Probes
     liveness, readiness, startup = None, None, None
     if app.health.enabled:
-        def make_probe(cfg_union: Union[str, ProbeConfig, None]):
-            if not cfg_union:
-                p = ProbeConfig(path=app.health.path, port=app.health.port or primary_container_port)
-            elif isinstance(cfg_union, str):
-                p = ProbeConfig(path=cfg_union, port=app.health.port or primary_container_port)
-            else:
-                p = cfg_union
-                if not p.port:
-                    p.port = app.health.port or primary_container_port
-                if not p.path:
-                    p.path = app.health.path
-            res = {
-                "initialDelaySeconds": p.initialDelaySeconds,
-                "periodSeconds": p.periodSeconds,
-                "timeoutSeconds": p.timeoutSeconds,
-                "failureThreshold": p.failureThreshold,
-            }
-            if p.path:
-                res["httpGet"] = {"path": p.path, "port": p.port}
-            else:
-                res["tcpSocket"] = {"port": p.port}
-            return res
-        liveness = make_probe(app.health.liveness)
-        readiness = make_probe(app.health.readiness)
-        startup = make_probe(app.health.startup)
+        liveness = _build_probe(app.health.liveness, app.health, primary_container_port)
+        readiness = _build_probe(app.health.readiness, app.health, primary_container_port)
+        startup = _build_probe(app.health.startup, app.health, primary_container_port)
 
     # 8. Service Configuration
-    svc_values = {"enabled": False}
-    svc_ports = []
-    svc_enabled = (app.service is not False) and (app.service is not None or app.ingress.enabled)
+    #
+    # Service is enabled when:
+    #   - NOT explicitly disabled via `service: false`
+    #   - AND either explicitly configured OR the ingress requires a backend
+    svc_explicitly_disabled = app.service is False
+    svc_explicitly_configured = isinstance(app.service, ServiceConfig)
+    svc_enabled = not svc_explicitly_disabled and (svc_explicitly_configured or app.ingress.enabled)
+
+    svc_values: dict = {"enabled": False}
+    svc_ports: list = []
     if svc_enabled:
         s = app.service if isinstance(app.service, ServiceConfig) else ServiceConfig()
         source_ports = s.ports.copy()
@@ -573,50 +701,72 @@ def build_values_yaml(
         svc_values = {"enabled": True, "type": s.type, "ports": svc_ports, "annotations": s.annotations}
 
     # 9. Ingress Configuration
-    ing_values = {"enabled": False}
+    ing_values: dict = {"enabled": False}
     if app.ingress.enabled:
         ing_values = app.ingress.model_dump(exclude_none=True)
+
+        # Expand shorthand host/path into hosts list
         if app.ingress.host and not app.ingress.hosts:
             ing_values["hosts"] = [{
                 "host": app.ingress.host,
                 "paths": [{"path": app.ingress.path or "/", "pathType": "ImplementationSpecific"}],
             }]
-        default_svc_port = app.ingress.servicePort or (svc_ports[0]["port"] if svc_enabled else primary_svc_port)
+
+        # Resolve default servicePort per path (explicit precedence: path > ingress > service > container)
+        if app.ingress.servicePort:
+            default_svc_port: Union[int, str] = app.ingress.servicePort
+        elif svc_enabled and svc_ports:
+            default_svc_port = svc_ports[0]["port"]
+        else:
+            default_svc_port = primary_svc_port
+
         for h in ing_values.get("hosts", []):
             for p in h.get("paths", []):
                 if not p.get("servicePort"):
                     p["servicePort"] = default_svc_port
 
+        # Merge Nginx default annotations with user-provided (user overrides defaults)
+        final_annotations: dict[str, str] = {}
+        if (app.ingress.className or "nginx") == "nginx":
+            final_annotations.update(_NGINX_DEFAULT_ANNOTATIONS)
+        final_annotations.update(app.ingress.annotations)  # User values win
+        ing_values["annotations"] = final_annotations
+
     # 10. Env Assembly
     #
-    # Priority / merge order:
-    #   a) Legacy env[]  → raw K8s EnvVar list
-    #   b) Legacy env_vars → per-key secretKeyRef from project secret (Vault-synced)
-    #   c) New envs[] → parsed via build_env_items()
-    #
-    #   d) Legacy envFrom[]  → raw K8s EnvFromSource list
-    #   e) Default: inject project ConfigMap via envFrom
-    #   f) New envs[] envFrom entries
+    # Merge order (later entries take precedence in K8s if duplicate names):
+    #   Env vars:   legacy env[] → legacy env_vars → new envs[]
+    #   Env from:   project ConfigMap (if exists) → legacy envFrom[] → new envs[] envFrom entries
 
-    # a) Legacy env[]
+    # a) Legacy env[] — raw K8s EnvVar list
     env_list: list = list(app.env)
 
-    # b) Legacy env_vars (Vault-synced keys → {project}-secret)
+    # b) Legacy env_vars — always inject keys into secretKeyRef from project secret.
+    #    Warn if the key is not declared as a Vault placeholder in the .env file,
+    #    but inject anyway because the K8s Secret may have been populated externally.
     for key in app.env_vars:
-        if key in secret_pool:
-            env_list.append({
-                "name": key,
-                "valueFrom": {"secretKeyRef": {"name": f"{project_name}-secret", "key": key}},
-            })
+        if key not in secret_pool:
+            print(
+                f"  [WARN] env_var '{key}' in app '{app.name}' is not declared in "
+                f"secret_pool (not found in .env as a ${{...}} placeholder). "
+                "Injecting anyway — ensure the key exists in the project Secret."
+            )
+        env_list.append({
+            "name": key,
+            "valueFrom": {"secretKeyRef": {"name": f"{project_name}-secret", "key": key}},
+        })
 
-    # c+f) New envs[]
+    # c) New envs[] — env vars from EnvItem list
     new_env_list, new_env_from_list = build_env_items(app.envs)
     env_list.extend(new_env_list)
 
-    # d) Legacy envFrom + e) project ConfigMap + f) new envFrom
-    env_from: list = [{"configMapRef": {"name": f"{project_name}-config"}}]
-    env_from.extend(app.envFrom)
-    env_from.extend(new_env_from_list)
+    # d) Env from sources
+    env_from: list = []
+    # Only inject the project ConfigMap if it actually exists (i.e., .env file had config data)
+    if config_pool:
+        env_from.append({"configMapRef": {"name": f"{project_name}-config"}})
+    env_from.extend(app.envFrom)          # Legacy envFrom[]
+    env_from.extend(new_env_from_list)    # New envs[] envFrom entries
 
     # 11. Container Ports
     deploy_ports = [
@@ -642,7 +792,11 @@ def build_values_yaml(
             "livenessProbe": liveness,
             "readinessProbe": readiness,
             "startupProbe": startup,
-            "imagePullSecrets": app.imagePullSecrets or project.imagePullSecrets or [{"name": DEFAULT_PULL_SECRET}],
+            "imagePullSecrets": (
+                app.imagePullSecrets
+                or project.imagePullSecrets
+                or [{"name": DEFAULT_PULL_SECRET}]
+            ),
             "podAnnotations": app.podAnnotations,
         },
         "serviceAccount": {
@@ -711,29 +865,27 @@ def main():
         sys.exit(1)
 
     project_vars = parse_env_file(env_path)
+    config_pool = project_vars[0]
+
     CHARTS_DIR = output_dir.resolve()
-    print(f"=== GitOps Engine Generator (RBAC Hardened) ===\nProject: {project_def.project} | Env: {args.env}")
+    print(f"=== GitOps Engine Generator ===\nProject: {project_def.project} | Env: {args.env}")
 
     # --- Generate project-shared chart ---
-    has_config = project_vars[0] or project_vars[1]
+    has_config = bool(config_pool) or bool(project_vars[1])
     has_pvcs = bool(project_def.pvcs)
     if has_config or has_pvcs:
         shared_dir = CHARTS_DIR / "project-shared"
         ensure_dir(shared_dir, args.dry_run)
         ensure_dir(shared_dir / "templates", args.dry_run)
         if not args.dry_run:
+            # project-shared does NOT depend on common-lib — it only contains
+            # plain K8s resources (ConfigMap, PVCs) that need no helper templates.
             shared_chart = {
                 "apiVersion": "v2",
                 "name": f"{project_def.project}-shared",
-                "description": "Shared resources (ConfigMap, Secrets, PVCs)",
+                "description": "Shared project resources: ConfigMap, PVCs (lifecycle-independent)",
                 "type": "application",
                 "version": "0.1.0",
-                "dependencies": [{
-                    "name": "common-lib",
-                    "version": project_def.common_version,
-                    "repository": f"file://{COMMON_LIB_REL_PATH}",
-                    "alias": "common-lib",
-                }],
             }
             write_yaml(shared_dir / "Chart.yaml", shared_chart, False)
 
@@ -742,7 +894,7 @@ def main():
                     "apiVersion": "v1",
                     "kind": "ConfigMap",
                     "metadata": {"name": f"{project_def.project}-config"},
-                    "data": project_vars[0],
+                    "data": config_pool,
                 }
                 write_yaml(shared_dir / "templates" / "configmap.yaml", cm, False)
 
@@ -759,6 +911,11 @@ def main():
         ensure_dir(chart_dir / "templates", args.dry_run)
         if not args.dry_run:
             (chart_dir / "templates" / "all.yaml").write_text(ALL_YAML_CONTENT)
+
+            # Compute relative path from THIS chart's directory to common-lib dynamically.
+            # This is more robust than a hardcoded constant if directory structure changes.
+            common_lib_rel = _get_common_lib_rel_path(chart_dir)
+
             desc = {
                 "apiVersion": "v2",
                 "name": app.name,
@@ -768,7 +925,7 @@ def main():
                 "dependencies": [{
                     "name": "common-lib",
                     "version": project_def.common_version,
-                    "repository": f"file://{COMMON_LIB_REL_PATH}",
+                    "repository": f"file://{common_lib_rel}",
                     "alias": "common-lib",
                 }],
             }

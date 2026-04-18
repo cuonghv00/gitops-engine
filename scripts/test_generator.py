@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from scripts.generator import (
     ProjectDefinition, AppConfig, EnvItem, VolumeItem, ProjectPVC,
     build_values_yaml, build_env_items, build_volume_items,
+    parse_env_file, _validate_k8s_name,
 )
 
 PASS = "✅ PASS"
@@ -306,8 +307,9 @@ results.append(test("secretEnv DB_PASS in env via secretKeyRef",
 
 # Check envFrom
 env_from = values["deployment"]["envFrom"]
-results.append(test("default project configMapRef in envFrom",
-    any(e.get("configMapRef", {}).get("name") == "test-proj-config" for e in env_from)))
+# LOGIC-2 fix: config_pool is empty ({}) so project configmap should NOT be injected
+results.append(test("no configmap in envFrom when config_pool empty",
+    not any(e.get("configMapRef", {}).get("name") == "test-proj-config" for e in env_from)))
 results.append(test("extra configMap in envFrom",
     any(e.get("configMapRef", {}).get("name") == "extra-cfg" for e in env_from)))
 results.append(test("extra secret in envFrom",
@@ -328,6 +330,170 @@ results.append(test("emptyDir cache volume",
 # Check image
 results.append(test("image repository", values["image"]["repository"] == "registry.vn/test/my-app"))
 results.append(test("image tag", values["image"]["tag"] == "v1.0"))
+
+# ===========================================================================
+# 7. BUG-1: env_vars — always inject, even if not in secret_pool
+# ===========================================================================
+section("7. BUG-1 Fix — env_vars always injected")
+
+project_b1 = ProjectDefinition(project="proj-b1", image_tag="v1", apps=[])
+app_b1 = AppConfig(
+    name="app-b1",
+    port=8080,
+    env_vars=["DB_URL", "API_KEY"],  # Neither key is in secret_pool
+)
+# Pass empty secret_pool — BUG-1 fix: both keys should still be injected
+values_b1 = build_values_yaml(app_b1, project_b1, ({}, []))
+env_b1 = values_b1["deployment"]["env"]
+results.append(test("env_var injected even when not in secret_pool",
+    any(e.get("name") == "DB_URL" and "secretKeyRef" in e.get("valueFrom", {}) for e in env_b1)))
+results.append(test("env_var API_KEY also injected",
+    any(e.get("name") == "API_KEY" and "secretKeyRef" in e.get("valueFrom", {}) for e in env_b1)))
+
+# ===========================================================================
+# 8. BUG-2: ingress + service=false → should fail at AppConfig validation
+# ===========================================================================
+section("8. BUG-2 Fix — ingress + service=false validation")
+
+try:
+    bad_app = AppConfig(
+        name="bad-app",
+        port=8080,
+        service=False,
+        ingress={"enabled": True, "host": "example.com"},
+    )
+    results.append(test("ingress + service=false → should fail at model", False, "No error raised"))
+except Exception as ex:
+    results.append(test("ingress + service=false → should fail at model",
+        "ingress.enabled=true requires a Service backend" in str(ex)))
+
+# ===========================================================================
+# 9. LOGIC-2: project ConfigMap only injected when config_pool has data
+# ===========================================================================
+section("9. LOGIC-2 Fix — conditional project ConfigMap injection")
+
+project_l2 = ProjectDefinition(project="proj-l2", image_tag="v1", apps=[])
+app_l2 = AppConfig(name="app-l2", port=8080)
+
+# No config_pool → no configmap
+values_no_cm = build_values_yaml(app_l2, project_l2, ({}, []))
+results.append(test("no configmap in envFrom when config_pool={}",
+    not any("configMapRef" in e for e in values_no_cm["deployment"]["envFrom"])))
+
+# With config_pool → configmap IS injected
+values_with_cm = build_values_yaml(app_l2, project_l2, ({"KEY": "val"}, []))
+results.append(test("configmap in envFrom when config_pool has data",
+    any(e.get("configMapRef", {}).get("name") == "proj-l2-config"
+        for e in values_with_cm["deployment"]["envFrom"])))
+
+# ===========================================================================
+# 10. LOGIC-3: Nginx annotations merged in generator
+# ===========================================================================
+section("10. LOGIC-3 Fix — Nginx annotations merge")
+
+project_l3 = ProjectDefinition(project="proj-l3", image_tag="v1", apps=[])
+app_nginx = AppConfig(
+    name="app-l3",
+    port=8080,
+    ingress={
+        "enabled": True,
+        "host": "test.example.com",
+        "className": "nginx",
+        "annotations": {"nginx.ingress.kubernetes.io/ssl-redirect": "true"},  # Override default
+    },
+)
+values_l3 = build_values_yaml(app_nginx, project_l3, ({}, []))
+annots = values_l3["ingress"]["annotations"]
+results.append(test("user override for ssl-redirect wins",
+    annots.get("nginx.ingress.kubernetes.io/ssl-redirect") == "true"))
+results.append(test("proxy-body-size default still present",
+    "nginx.ingress.kubernetes.io/proxy-body-size" in annots))
+
+# Non-nginx: no default annotations injected
+app_traefik = AppConfig(
+    name="traefik-app",
+    port=8080,
+    ingress={"enabled": True, "host": "t.example.com", "className": "traefik"},
+)
+values_traefik = build_values_yaml(app_traefik, project_l3, ({}, []))
+annots_traefik = values_traefik["ingress"].get("annotations", {})
+results.append(test("non-nginx: no default nginx annotations",
+    "nginx.ingress.kubernetes.io/ssl-redirect" not in annots_traefik))
+
+# ===========================================================================
+# 11. IMPROVE-2: K8s name validation
+# ===========================================================================
+section("11. IMPROVE-2 — K8s name validation")
+
+# Valid name
+try:
+    _validate_k8s_name("my-app")
+    results.append(test("valid k8s name 'my-app'", True))
+except Exception as ex:
+    results.append(test("valid k8s name 'my-app'", False, str(ex)))
+
+# Invalid: uppercase
+try:
+    _validate_k8s_name("MyApp")
+    results.append(test("uppercase name → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("uppercase name → should fail", True))
+
+# Invalid: underscore
+try:
+    _validate_k8s_name("my_app")
+    results.append(test("underscore name → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("underscore name → should fail", True))
+
+# Invalid: starts with dash
+try:
+    _validate_k8s_name("-myapp")
+    results.append(test("leading dash → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("leading dash → should fail", True))
+
+# Invalid: too long
+try:
+    _validate_k8s_name("a" * 64)
+    results.append(test("64-char name → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("64-char name → should fail", True))
+
+# App validation catches bad name
+try:
+    AppConfig(name="Bad_Name", port=8080)
+    results.append(test("AppConfig with bad name → should fail", False, "No error raised"))
+except Exception:
+    results.append(test("AppConfig with bad name → should fail", True))
+
+# ===========================================================================
+# 12. LOGIC-5: parse_env_file quote handling
+# ===========================================================================
+section("12. LOGIC-5 Fix — parse_env_file quote handling")
+
+import tempfile, os
+with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+    f.write('DB_URL="postgres://user:pass@host:5432/db"\n')
+    f.write("API_SECRET='my-secret-value'\n")
+    f.write('PLAIN=hello=world\n')
+    f.write('VAULT_KEY=${vault:secret/data/key}\n')
+    f.write('# comment line\n')
+    tmp_path = f.name
+
+from pathlib import Path as _Path
+cfg, secrets = parse_env_file(_Path(tmp_path))
+os.unlink(tmp_path)
+
+results.append(test('double-quoted value stripped correctly',
+    cfg.get('DB_URL') == 'postgres://user:pass@host:5432/db'))
+results.append(test("single-quoted value stripped correctly",
+    cfg.get('API_SECRET') == 'my-secret-value'))
+results.append(test('value with = inside parsed correctly',
+    cfg.get('PLAIN') == 'hello=world'))
+results.append(test('vault placeholder detected as secret',
+    'VAULT_KEY' in secrets))
+results.append(test('comment line ignored', 'DB_URL' in cfg and len(cfg) == 3))
 
 # ===========================================================================
 # Summary

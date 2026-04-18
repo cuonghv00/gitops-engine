@@ -2,9 +2,12 @@
 ================================================================================
   common-lib/_ingress.yaml
   Reusable template that renders a Kubernetes Ingress resource.
-  
-  Per-path servicePort supports both port name (string) and port number (int).
-  If omitted, defaults to the first service port.
+
+  Key behaviors:
+  - Nginx default annotations are injected and merged with user overrides
+    by the generator (not hardcoded here) — this allows per-app full override.
+  - Per-path servicePort supports both integers ('number') and strings ('name').
+  - TLS is rendered only when .Values.ingress.tls is defined.
 ================================================================================
 */}}
 {{- define "common-lib.ingress" -}}
@@ -12,18 +15,13 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "common-lib.fullname" . }}
+  name: {{ $fullName }}
   labels:
     {{- include "common-lib.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
   annotations:
-    {{- /* Default Nginx annotations when className is 'nginx' (or not set) */}}
-    {{- if eq (.Values.ingress.className | default "nginx") "nginx" }}
-    nginx.ingress.kubernetes.io/ssl-redirect: "false"
-    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
-    {{- end }}
-    {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
-    {{- end }}
+  {{- end }}
 spec:
   ingressClassName: {{ .Values.ingress.className | default "nginx" }}
   {{- if .Values.ingress.tls }}
