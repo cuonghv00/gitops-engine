@@ -1,7 +1,7 @@
 # projects/phoenix-project/apps.dev.yaml
 # ==============================================================================
 # Reference Project: E-commerce Platform
-# Use this file as a guide for configuring different types of applications.
+# Uses the Modernized GitOps Engine Schema (Flattened Envs & Volumes)
 # ==============================================================================
 
 project: "phoenix-project"
@@ -9,9 +9,13 @@ common_version: "1.0.0"
 image_repo: "registry.vn/phoenix-project"
 image_tag: "latest"
 
-# 1. Global Project Variables (Injected via envFrom to all apps)
-# These are defined in variables.env in the same directory.
-# generator.py auto-creates a ConfigMap named 'phoenix-project-config'.
+# ------------------------------------------------------------------------------
+# Project-level PVCs (Lifecycle independent from apps)
+# ------------------------------------------------------------------------------
+pvcs:
+  - name: "redis-data"
+    size: "10Gi"
+    storageClass: "standard"
 
 apps:
   # ----------------------------------------------------------------------------
@@ -25,9 +29,23 @@ apps:
   # EXAMPLE 2: API Gateway (Intermediate)
   # Demonstrates Ingress, basic Health Checks, and Resource Limits.
   # ----------------------------------------------------------------------------
-  - name: "api-gateway"
-    port: 80
+  - name: api-gateway
+    image: registry.vn/phoenix-project/api-gateway
+    port: 8080
     replicas: 2
+    initContainers:
+      - name: init-db
+        image: busybox:1.36
+        command: ["sh", "-c", "echo waiting for db; sleep 1"]
+    sidecars:
+      - name: cloud-sql-proxy
+        image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.1.0
+        args:
+          - "--port=5432"
+          - "project:region:instance"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65532
     resources:
       limits:
         cpu: "500m"
@@ -45,48 +63,56 @@ apps:
         path: "/health"
         failureThreshold: 30 # Allow 30 * 10s = 5 mins for slow startup
         periodSeconds: 10
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
 
   # ----------------------------------------------------------------------------
   # EXAMPLE 3: User Service (Advanced)
-  # Demonstrates Env Variables, Secrets (from Vault), and Custom Port Mapping.
+  # Demonstrates flattened envs with mixed sources (plain + secretKeyRef).
   # ----------------------------------------------------------------------------
   - name: "user-service"
     image_tag: "v1.2.3"  # Overrides global image_tag
     port: 3000           # Container port
     service:
       port: 80           # Service port (80) maps to Container port (3000)
-    # env_vars: mapping these keys from Vault/SharedConfig
-    env_vars:
-      - DATABASE_URL     # From shared variables.env
-      - DB_PASSWORD      # From Vault (injected via vault_sync.sh)
-      - AUTH_SECRET      # From Vault
-    env:                 # Ad-hoc environment variables
+    
+    envs:
       - name: LOG_LEVEL
         value: "debug"
+      - secretEnv: phoenix-project-secret
+        vars:
+          - DATABASE_URL     # From shared variables.env
+          - DB_PASSWORD      # From Vault
+          - AUTH_SECRET      # From Vault
 
   # ----------------------------------------------------------------------------
   # EXAMPLE 4: Redis Proxy (Stateful/Storage)
-  # Demonstrates TCP Health Checks and Persistence (PVC).
+  # Demonstrates flattened volumes referencing a ProjectPVC.
   # ----------------------------------------------------------------------------
   - name: "redis-proxy"
     port: 6379
     health:
       enabled: true
       # No 'path' provided -> generator.py auto-sets tcpSocket check
-    pvc:
-      enabled: true
-      size: "10Gi"
-      storageClass: "standard"
-      mountPath: "/data"
+    
+    volumes:
+      - name: redis-storage
+        mountPath: /data
+        pvc: redis-data
 
   # ----------------------------------------------------------------------------
-  # EXAMPLE 5: Order Service (Multi-Port Support)
-  # NEW: Testing the multi-port and strict schema features.
+  # EXAMPLE 5: Order Service (Multi-Port & RBAC Security)
+  # Demonstrates multi-port and strict RBAC schema.
   # ----------------------------------------------------------------------------
   - name: "order-service"
     type: "deployment"
     replicas: 1
-    # Multiple ports definition
     ports:
       - name: "http"
         port: 80
@@ -94,16 +120,65 @@ apps:
       - name: "grpc"
         port: 50051
         targetPort: 50051
-    service:
-      type: "ClusterIP"
-    # Hardened RBAC Security
+    
     serviceAccount:
       create: true           # Creates order-service-sa
       automountToken: false  # Maximum Security
+    
     ingress:
       enabled: true
       host: "orders.phoenix-project.vn"
-      servicePort: "http" # Reference port by name
+      servicePort: "http"    # Reference port by name
+    
     health:
       enabled: true
-      liveness: "/health" # Targets the primary port (first in the list)
+      liveness:
+        grpc:
+          port: 50051
+
+  # ----------------------------------------------------------------------------
+  # EXAMPLE 6: Database Migration (Job)
+  # Demonstrates: type=job, batch config, command override.
+  # Runs once: executes DB migrations then terminates.
+  # ----------------------------------------------------------------------------
+  - name: db-migrate
+    type: job
+    image: registry.vn/phoenix-project/migrator:v1.2.0
+    command: ["/app/migrate", "--env=dev", "--run"]
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+    job:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 600   # Cleanup pods after 10 minutes
+      restartPolicy: OnFailure
+
+  # ----------------------------------------------------------------------------
+  # EXAMPLE 7: Database Backup (CronJob)
+  # Demonstrates: type=cronjob, schedule, concurrencyPolicy, job config.
+  # Runs every day at 2 AM, forbids concurrent runs.
+  # ----------------------------------------------------------------------------
+  - name: backup-db
+    type: cronjob
+    image: registry.vn/phoenix-project/backup:v1.0.0
+    command: ["/backup.sh"]
+    resources:
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+    cronjob:
+      schedule: "0 2 * * *"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+    job:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600    # Abort if still running after 1 hour
+      ttlSecondsAfterFinished: 86400 # Cleanup after 24 hours

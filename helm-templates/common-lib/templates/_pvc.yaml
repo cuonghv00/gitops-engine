@@ -17,7 +17,11 @@ spec:
   resources:
     requests:
       storage: {{ .Values.pvc.size | quote }}
-  {{- if .Values.pvc.storageClass }}
+  {{- /* HELM-03 FIX: Use 'hasKey' not a falsy check.
+       storageClass: ""  (empty string) = "bind to PV with no StorageClass" — a valid K8s semantic.
+       The original 'if .Values.pvc.storageClass' would silently drop it (empty string is falsy in Go templates).
+       This mirrors the LOGIC-1 fix in generator.py that uses 'is not None' not truthiness. */}}
+  {{- if hasKey .Values.pvc "storageClass" }}
   storageClassName: {{ .Values.pvc.storageClass | quote }}
   {{- end }}
 {{- end }}

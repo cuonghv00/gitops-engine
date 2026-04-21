@@ -17,7 +17,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import yaml
 from pydantic import BaseModel, Field, ConfigDict, model_validator
@@ -36,6 +36,30 @@ COMMON_LIB_PATH = REPO_ROOT / "helm-templates" / "common-lib"
 _NGINX_DEFAULT_ANNOTATIONS: dict[str, str] = {
     "nginx.ingress.kubernetes.io/ssl-redirect": "false",
     "nginx.ingress.kubernetes.io/proxy-body-size": "8m",
+}
+
+# Default Pod-level security context applied to all workloads.
+# These fields are valid ONLY at pod spec level (NOT container level):
+#   - runAsNonRoot, runAsUser, runAsGroup: identity controls shared across containers
+#   - fsGroup: sets GID ownership for mounted volumes (PVCs, secrets, etc.)
+# Users can override any field via AppConfig.podSecurityContext.
+_DEFAULT_POD_SEC_CTX: dict = {
+    "runAsNonRoot": True,
+    "runAsUser": 1000,
+    "runAsGroup": 1000,
+    "fsGroup": 1000,
+}
+
+# Default Container-level security context applied to main containers.
+# Separate from pod-level context — these fields are valid ONLY at container level.
+# Extracted as constant to avoid duplicate definitions (DRY).
+_DEFAULT_CONTAINER_SEC_CTX: dict = {
+    "readOnlyRootFilesystem": True,
+    "allowPrivilegeEscalation": False,
+    "runAsNonRoot": True,
+    "runAsUser": 1000,
+    "runAsGroup": 1000,
+    "capabilities": {"drop": ["ALL"]},
 }
 
 # ---------------------------------------------------------------------------
@@ -67,6 +91,46 @@ def _validate_k8s_name(name: str, label: str = "name") -> str:
 def _get_common_lib_rel_path(from_dir: Path) -> str:
     """Compute the relative path from a chart directory to the common-lib chart."""
     return os.path.relpath(COMMON_LIB_PATH, from_dir)
+
+
+def _resolve_image(
+    image: Optional[str],
+    image_repo: str,
+    name: str,
+    image_tag_override: Optional[str],
+    item_image_tag: Optional[str],
+    project_image_tag: str,
+) -> tuple[str, str]:
+    """Resolve (image_name, tag) from a flexible image configuration.
+
+    Priority chain: image_tag_override > embedded URI tag > item_image_tag > project_image_tag.
+
+    Args:
+        image:             Full image URI (may include embedded tag, e.g. 'redis:7.2-alpine')
+        image_repo:        Resolved registry/repo prefix (e.g. 'registry.vn/platform')
+        name:              Resource name — used for default URI when 'image' is unset
+        image_tag_override: CLI --image-tag override (highest priority)
+        item_image_tag:    App/container-level image_tag config
+        project_image_tag: Project-level fallback image_tag
+
+    Returns:
+        (image_name, tag) tuple — e.g. ('registry.vn/platform/my-app', 'v1.2.3')
+    """
+    if image:
+        last_segment = image.split("/")[-1]
+        if ":" in last_segment:
+            # URI contains embedded tag — split on last ':' in the final segment
+            # e.g. 'gcr.io/project/app:v1.2' → ('gcr.io/project/app', 'v1.2')
+            split_pos = image.rfind(":")
+            image_name = image[:split_pos]
+            tag = image_tag_override or image[split_pos + 1:]
+        else:
+            image_name = image
+            tag = image_tag_override or item_image_tag or project_image_tag
+    else:
+        image_name = f"{image_repo}/{name}"
+        tag = image_tag_override or item_image_tag or project_image_tag
+    return image_name, tag
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +166,7 @@ class ProbeConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
     path: Optional[str] = None
     port: Optional[Union[int, str]] = None
+    grpc: Optional[dict] = None
     initialDelaySeconds: int = 10
     periodSeconds: int = 5
     timeoutSeconds: int = 2
@@ -156,9 +221,12 @@ class ServicePort(BaseModel):
 
 
 class ServiceAccountConfig(BaseModel):
-    model_config = ConfigDict(extra='forbid')
+    model_config = ConfigDict(extra='forbid', populate_by_name=True)
     create: bool = True
-    automountToken: bool = False  # Hardened default (RBAC Security)
+    # 'automountToken' is the user-facing field name in apps.yaml.
+    # serialization_alias ensures model_dump(by_alias=True) emits 'automountServiceAccountToken'
+    # which is the Kubernetes API field name used in both Pod spec and ServiceAccount resource.
+    automountToken: bool = Field(False, serialization_alias="automountServiceAccountToken")  # Hardened default (RBAC Security)
     name: Optional[str] = None   # If set, overrides the auto-generated fullname
 
 
@@ -284,11 +352,98 @@ class VolumeItem(BaseModel):
         return self
 
 
+class ExtraContainerConfig(BaseModel):
+    """Configuration for initContainers or sidecars."""
+    model_config = ConfigDict(extra='forbid')
+
+    name: str
+    image: Optional[str] = None
+    image_repo: Optional[str] = None
+    image_tag: Optional[str] = None
+    pullPolicy: Optional[str] = None
+
+    command: Optional[list[str]] = None
+    args: Optional[list[str]] = None
+
+    envs: list[EnvItem] = Field(default_factory=list)
+    volumes: list[VolumeItem] = Field(default_factory=list)
+
+    resources: dict = Field(default_factory=dict)
+    securityContext: dict = Field(default_factory=dict)
+    health: HealthConfig = Field(default_factory=HealthConfig)
+
+    # Primarily for native sidecars in initContainers (K8s 1.29+)
+    # Set to 'Always' to make an initContainer a sidecar.
+    restartPolicy: Optional[str] = None
+
+    @model_validator(mode='after')
+    def validate_container(self) -> 'ExtraContainerConfig':
+        _validate_k8s_name(self.name, "Container name")
+        return self
+
+
+class JobConfig(BaseModel):
+    """
+    Kubernetes Job-specific configuration.
+    Applied when AppConfig.type == 'job' or 'cronjob'.
+
+    All fields are optional — K8s defaults apply when omitted.
+    """
+    model_config = ConfigDict(extra='forbid')
+
+    completions: Optional[int] = None             # Total successful pod completions required
+    parallelism: Optional[int] = None             # Max pods running concurrently
+    backoffLimit: Optional[int] = None            # Retry limit before marking the Job failed (K8s default: 6)
+    activeDeadlineSeconds: Optional[int] = None   # Max job run time; Job is terminated if exceeded
+    ttlSecondsAfterFinished: Optional[int] = None # Cleanup delay (TTL) after Job completion
+    restartPolicy: str = "Never"                  # Pod restart policy: Never (default) or OnFailure
+
+
+class CronJobConfig(BaseModel):
+    """
+    Kubernetes CronJob-specific configuration.
+    Applied when AppConfig.type == 'cronjob'.
+
+    schedule is REQUIRED when type == 'cronjob'.
+    """
+    model_config = ConfigDict(extra='forbid')
+
+    schedule: str                                         # Cron expression, e.g. "0 2 * * *"
+    concurrencyPolicy: str = "Allow"                      # Allow | Forbid | Replace
+    suspend: bool = False                                 # Pause scheduling
+    successfulJobsHistoryLimit: int = 3                   # Retain N completed Job records
+    failedJobsHistoryLimit: int = 1                       # Retain N failed Job records
+    startingDeadlineSeconds: Optional[int] = None         # Deadline for starting a missed job
+
+
+class HPAConfig(BaseModel):
+    """
+    Kubernetes HorizontalPodAutoscaler configuration.
+    Applied when AppConfig.type == 'deployment' and hpa.enabled == True.
+
+    Uses autoscaling/v2 API (stable from K8s 1.23+).
+
+    The generator will automatically OMIT the 'replicas' field from the Deployment
+    spec when HPA is enabled, preventing a control loop conflict where the Deployment
+    controller and the HPA controller fight over the replica count.
+    """
+    model_config = ConfigDict(extra='forbid')
+
+    enabled: bool = False
+    minReplicas: int = 1
+    maxReplicas: int = 5
+    # CPU utilization target as a percentage of the container's request.
+    targetCPUUtilizationPercentage: Optional[int] = None
+    # Memory utilization target as a percentage of the container's request.
+    targetMemoryUtilizationPercentage: Optional[int] = None
+    behavior: dict = Field(default_factory=dict)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     name: str
-    type: str = "deployment"
+    type: Literal["deployment", "job", "cronjob"] = "deployment"
 
     port: Optional[int] = None
     ports: list[ServicePort] = Field(default_factory=list)
@@ -302,6 +457,9 @@ class AppConfig(BaseModel):
 
     resources: dict = Field(default_factory=dict)
     securityContext: dict = Field(default_factory=dict)
+    # Pod-level security context — valid pod spec fields only: fsGroup, supplementalGroups, etc.
+    # Do NOT put container-level fields (readOnlyRootFilesystem, capabilities) here.
+    podSecurityContext: dict = Field(default_factory=dict)
     auto_mount_tmp: bool = True
 
     # --- New flattened env/volume declarations ---
@@ -327,6 +485,21 @@ class AppConfig(BaseModel):
     genConfigMaps: bool = False
     podAnnotations: dict[str, str] = Field(default_factory=dict)
 
+    # Init containers and sidecars
+    initContainers: list[ExtraContainerConfig] = Field(default_factory=list)
+    sidecars: list[ExtraContainerConfig] = Field(default_factory=list)
+
+    # Entrypoint overrides for main container
+    command: Optional[list[str]] = None
+    args: Optional[list[str]] = None
+
+    # Batch workload configs
+    job: Optional[JobConfig] = None
+    cronjob: Optional[CronJobConfig] = None
+
+    # Autoscaling config (deployment only)
+    hpa: HPAConfig = Field(default_factory=HPAConfig)
+
     @model_validator(mode='after')
     def validate_app(self) -> 'AppConfig':
         # Validate K8s-compatible name
@@ -347,6 +520,41 @@ class AppConfig(BaseModel):
                 "Remove 'service: false' or disable the ingress."
             )
 
+        # Batch type validations
+        if self.type == "cronjob":
+            if self.cronjob is None:
+                raise ValueError(
+                    f"App '{self.name}': type='cronjob' requires a 'cronjob' configuration block "
+                    "with at least a 'schedule' field."
+                )
+            if self.ingress.enabled:
+                raise ValueError(
+                    f"App '{self.name}': type='cronjob' cannot have ingress enabled. "
+                    "CronJobs are batch workloads with no inbound traffic."
+                )
+        if self.type == "job":
+            if self.ingress.enabled:
+                raise ValueError(
+                    f"App '{self.name}': type='job' cannot have ingress enabled. "
+                    "Jobs are batch workloads with no inbound traffic."
+                )
+
+        # HPA validation: only valid for Deployment type
+        if self.hpa.enabled and self.type != "deployment":
+            raise ValueError(
+                f"App '{self.name}': hpa.enabled=true is only supported for type='deployment'. "
+                f"Current type is '{self.type}'. Jobs and CronJobs scale differently."
+            )
+        # HPA requires at least one metric target
+        if self.hpa.enabled and (
+            self.hpa.targetCPUUtilizationPercentage is None
+            and self.hpa.targetMemoryUtilizationPercentage is None
+        ):
+            raise ValueError(
+                f"App '{self.name}': hpa.enabled=true requires at least one metric target. "
+                "Set 'targetCPUUtilizationPercentage' or 'targetMemoryUtilizationPercentage'."
+            )
+
         return self
 
 
@@ -364,6 +572,13 @@ class ProjectDefinition(BaseModel):
     @model_validator(mode='after')
     def validate_project(self) -> 'ProjectDefinition':
         _validate_k8s_name(self.project, "Project name")
+        # Validate common_version follows semver (required by Helm dependency resolution).
+        # Helm uses this to match the chart version in common-lib/Chart.yaml.
+        if not re.match(r'^\d+\.\d+\.\d+', self.common_version):
+            raise ValueError(
+                f"common_version '{self.common_version}' must follow semver format "
+                "(e.g. '1.0.0', '2.3.1'). Helm requires this for dependency resolution."
+            )
         return self
 
 
@@ -470,7 +685,9 @@ def _build_probe(
         "timeoutSeconds": timeout,
         "failureThreshold": failure,
     }
-    if path:
+    if getattr(cfg_union, 'grpc', None) is not None:
+        res["grpc"] = getattr(cfg_union, 'grpc')
+    elif path:
         res["httpGet"] = {"path": path, "port": port}
     else:
         res["tcpSocket"] = {"port": port}
@@ -602,11 +819,167 @@ def build_volume_items(volumes: list[VolumeItem]) -> tuple[list, list]:
 # Logic Builders
 # ---------------------------------------------------------------------------
 
+def _build_container_dict(
+    name: str,
+    container_cfg: Union[AppConfig, ExtraContainerConfig],
+    project: ProjectDefinition,
+    project_vars: tuple[dict, list],
+    image_tag_override: Optional[str] = None,
+    is_main: bool = False,
+    allow_probes: bool = True,
+    primary_port: Optional[int] = None,
+) -> dict:
+    """Build a K8s container dictionary.
+
+    Handles image resolution, envs, volume mounts, probes, command/args, etc.
+
+    Args:
+        allow_probes: If False, probes are never rendered even if health.enabled=True.
+                      Must be False for classic Init Containers (K8s will reject otherwise).
+                      True for main container, native sidecars (restartPolicy=Always), and
+                      traditional sidecars.
+    """
+    config_pool, secret_pool = project_vars
+    project_name = project.project
+
+    # 1. Image logic
+    image_repo = container_cfg.image_repo or project.image_repo or DEFAULT_REGISTRY
+    image_name, tag = _resolve_image(
+        image=container_cfg.image,
+        image_repo=image_repo,
+        name=name,
+        image_tag_override=image_tag_override,
+        item_image_tag=container_cfg.image_tag,
+        project_image_tag=project.image_tag,
+    )
+
+    # 2. Security Context
+    # For the main container: apply the full hardened default policy, then merge user overrides.
+    # For extra containers (init/sidecar): use a safe default (runAsNonRoot) unless fully overridden.
+    # The user can still bypass this by explicitly providing {"runAsNonRoot": False}.
+    if is_main:
+        sec_ctx = {**_DEFAULT_CONTAINER_SEC_CTX, **container_cfg.securityContext}
+    else:
+        # Extra containers: use default runAsNonRoot: true if not explicitly set
+        default_extra_sec_ctx: dict = {
+            "runAsNonRoot": True
+        }
+        sec_ctx = {**default_extra_sec_ctx, **container_cfg.securityContext}
+
+    # 3. Volumes & Mounts
+    volume_mounts: list = []
+
+    # Auto-mount /tmp emptyDir only for the main container (which has readOnlyRootFilesystem=true).
+    # Extra containers manage their own write paths; force-mounting /tmp on a 3rd-party
+    # image (busybox, envoy, etc.) is unnecessary and potentially incorrect.
+    if is_main:
+        user_mounts_tmp = any(
+            (v.mountPath == "/tmp" if v.k8s is None else
+             v.k8s.get("mount", {}).get("mountPath") == "/tmp")
+            for v in container_cfg.volumes
+        )
+        if sec_ctx.get("readOnlyRootFilesystem") and getattr(container_cfg, 'auto_mount_tmp', True) and not user_mounts_tmp:
+            volume_mounts.append({"name": "tmp", "mountPath": "/tmp"})
+
+    # Legacy support only for main container
+    if is_main:
+        app_cfg = container_cfg  # type: ignore
+        if app_cfg.mount_env_file:
+            volume_mounts.append({"name": "env-file", "mountPath": "/app/.env", "subPath": ".env"})
+        if app_cfg.pvc.enabled and app_cfg.pvc.mountPath:
+            volume_mounts.append({"name": "data-volume", "mountPath": app_cfg.pvc.mountPath})
+
+    # Flattened volumes
+    _, new_mounts = build_volume_items(container_cfg.volumes)
+    volume_mounts.extend(new_mounts)
+
+    # 4. Env Assembly
+    env_list: list = []
+    # a) Legacy main container envs
+    if is_main:
+        app_cfg = container_cfg  # type: ignore
+        env_list.extend(list(app_cfg.env))
+
+        for key in app_cfg.env_vars:
+            if key not in secret_pool:
+                print(
+                    f"  [WARN] env_var '{key}' in container '{name}' is not declared in "
+                    f"secret_pool (not found in .env as a ${{...}} placeholder). "
+                    "Injecting anyway — ensure the key exists in the project Secret."
+                )
+            env_list.append({
+                "name": key,
+                "valueFrom": {"secretKeyRef": {"name": f"{project_name}-secret", "key": key}},
+            })
+
+    # b) New flattened envs
+    new_env_list, new_env_from_list = build_env_items(container_cfg.envs)
+    env_list.extend(new_env_list)
+
+    # c) Env from sources
+    env_from: list = []
+    # Project-shared ConfigMap is ONLY injected into the main container.
+    # Init/sidecar containers are self-contained — if they need a ConfigMap,
+    # the user must explicitly declare it via envs: [{configMap: ...}].
+    if is_main:
+        app_cfg = container_cfg  # type: ignore
+        if config_pool:
+            env_from.append({"configMapRef": {"name": f"{project_name}-config"}})
+        env_from.extend(app_cfg.envFrom)
+
+    env_from.extend(new_env_from_list)
+
+    # 5. Probes
+    # Classic Init Containers (no restartPolicy) MUST NOT have probes — K8s will reject the manifest.
+    # Native Sidecars (restartPolicy: Always) and traditional Sidecars support probes normally.
+    # The caller controls this via the `allow_probes` parameter.
+    probes: dict = {}
+    if allow_probes and container_cfg.health.enabled:
+        fallback_port = getattr(container_cfg, 'port', None) or primary_port
+        if liveness := _build_probe(container_cfg.health.liveness, container_cfg.health, fallback_port):
+            probes["livenessProbe"] = liveness
+        if readiness := _build_probe(container_cfg.health.readiness, container_cfg.health, fallback_port):
+            probes["readinessProbe"] = readiness
+        if startup := _build_probe(container_cfg.health.startup, container_cfg.health, fallback_port):
+            probes["startupProbe"] = startup
+
+    # 6. Container Ports
+    c_ports: list = []
+    if is_main:
+        # For main container, we collect ports from AppConfig.ports or AppConfig.port
+        # but build_values_yaml handles this via all_ports list. We'll pass it in later.
+        pass
+    elif hasattr(container_cfg, 'port') and container_cfg.port: # Special case if extra container has a single port
+        c_ports.append({"name": "http", "containerPort": container_cfg.port, "protocol": "TCP"})
+
+    # 7. Final Spec
+    res = {
+        "name": name,
+        "image": f"{image_name}:{tag}",
+        "imagePullPolicy": container_cfg.pullPolicy or "IfNotPresent",
+        "securityContext": sec_ctx,
+        "env": env_list,
+        "envFrom": env_from,
+        "resources": container_cfg.resources,
+        "volumeMounts": volume_mounts,
+    }
+    if container_cfg.command: res["command"] = container_cfg.command
+    if container_cfg.args: res["args"] = container_cfg.args
+    if c_ports: res["ports"] = c_ports
+    res.update(probes)
+
+    if hasattr(container_cfg, 'restartPolicy') and container_cfg.restartPolicy:
+        res["restartPolicy"] = container_cfg.restartPolicy
+
+    return res
+
+
 def build_values_yaml(
     app: AppConfig,
     project: ProjectDefinition,
     project_vars: tuple[dict, list],
-    image_tag: str = None,
+    image_tag: Optional[str] = None,
+    allow_latest: bool = True,
 ) -> dict:
     config_pool, secret_pool = project_vars
     project_name = project.project
@@ -625,86 +998,141 @@ def build_values_yaml(
     primary_svc_port = all_ports[0].port
     primary_container_port = all_ports[0].targetPort or all_ports[0].port
 
-    # 2. Image logic
+    # 2. Image logic — delegate to _resolve_image() to avoid duplication
     image_repo = app.image_repo or project.image_repo or DEFAULT_REGISTRY
+    image_name, tag = _resolve_image(
+        image=app.image,
+        image_repo=image_repo,
+        name=app.name,
+        image_tag_override=image_tag,
+        item_image_tag=app.image_tag,
+        project_image_tag=project.image_tag,
+    )
 
-    # BUG-1 FIX: Parse embedded tag from image URI before falling back to config.
-    # e.g. 'redis:7.2-alpine' or 'myrepo/myapp:v1.2' — split on last ':' in final segment.
-    if app.image:
-        last_segment = app.image.split("/")[-1]
-        if ":" in last_segment:
-            # URI contains an embedded tag — extract it
-            split_pos = app.image.rfind(":")
-            image_name = app.image[:split_pos]
-            # CLI --image-tag always overrides embedded tag; otherwise use embedded tag
-            tag = image_tag or app.image[split_pos + 1:]
-        else:
-            image_name = app.image
-            tag = image_tag or app.image_tag or project.image_tag
-    else:
-        image_name = f"{image_repo}/{app.name}"
-        tag = image_tag or app.image_tag or project.image_tag
-
-    # Warn on non-deterministic 'latest' tag
+    # Guard against non-deterministic 'latest' tag.
+    # When allow_latest=False (CI production mode), raise to block the pipeline.
     if tag == "latest":
+        if allow_latest:
+            print(
+                f"  [WARN] App '{app.name}' uses image tag 'latest' — "
+                "consider pinning to a specific version for reproducible deployments."
+            )
+        else:
+            raise ValueError(
+                f"App '{app.name}' uses non-deterministic image tag 'latest'. "
+                "Pin to a specific version, or pass --allow-latest to override."
+            )
+
+    # SEC-H3 FIX: Warn when resource limits are not defined.
+    # Missing limits can cause noisy-neighbor issues and resource exhaustion in production.
+    if not app.resources:
         print(
-            f"  [WARN] App '{app.name}' uses image tag 'latest' — "
-            "consider pinning to a specific version for reproducible deployments."
+            f"  [WARN] App '{app.name}' has no resource limits defined. "
+            "Consider setting resources.limits and resources.requests for production workloads."
         )
 
     # 3. Security Context & Base Volumes
-    default_sec_ctx: dict = {
-        "readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False,
-        "runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000,
-        "capabilities": {"drop": ["ALL"]}
-    }
-    sec_ctx = {**default_sec_ctx, **app.securityContext}
+    sec_ctx = {**_DEFAULT_CONTAINER_SEC_CTX, **app.securityContext}
 
-    volumes: list = []
-    volume_mounts: list = []
+    # 3. Probes (built inside _build_container_dict)
+    # 4. Envs (built inside _build_container_dict)
 
-    # Auto-mount /tmp emptyDir when readOnlyRootFilesystem is enabled.
-    # BUG-2 FIX: Skip if user has explicitly defined a volume mounted at /tmp
-    # (user volumes processed later, so check VolumeItem list directly).
-    user_mounts_tmp = any(
+    # 5. Volumes (Pod-level collection)
+    pod_volumes: list = []
+
+    # /tmp volume
+    user_mounts_tmp_any = any(
         (v.mountPath == "/tmp" if v.k8s is None else
          v.k8s.get("mount", {}).get("mountPath") == "/tmp")
         for v in app.volumes
     )
-    if sec_ctx.get("readOnlyRootFilesystem") and app.auto_mount_tmp and not user_mounts_tmp:
-        volumes.append({"name": "tmp", "emptyDir": {}})
-        volume_mounts.append({"name": "tmp", "mountPath": "/tmp"})
+    # Check all init/sidecar volumes too for /tmp
+    for c in app.initContainers + app.sidecars:
+        if any((v.mountPath == "/tmp" if v.k8s is None else v.k8s.get("mount", {}).get("mountPath") == "/tmp") for v in c.volumes):
+            user_mounts_tmp_any = True
+            break
 
-    # 4. [DEPRECATED] Legacy mount_env_file
+    if sec_ctx.get("readOnlyRootFilesystem") and app.auto_mount_tmp and not user_mounts_tmp_any:
+        pod_volumes.append({"name": "tmp", "emptyDir": {}})
+
     if app.mount_env_file:
-        volumes.append({"name": "env-file", "configMap": {"name": f"{project_name}-config"}})
-        volume_mounts.append({"name": "env-file", "mountPath": "/app/.env", "subPath": ".env"})
+        pod_volumes.append({"name": "env-file", "configMap": {"name": f"{project_name}-config"}})
 
-    # 5. [DEPRECATED] Legacy per-app pvc (creates PVC inside app chart)
     if app.pvc.enabled and app.pvc.mountPath:
-        volumes.append({
+        pod_volumes.append({
             "name": "data-volume",
             "persistentVolumeClaim": {"claimName": '{{ include "common-lib.fullname" . }}'},
         })
-        volume_mounts.append({"name": "data-volume", "mountPath": app.pvc.mountPath})
 
-    # 6. New flattened volumes
-    new_vols, new_mounts = build_volume_items(app.volumes)
-    volumes.extend(new_vols)
-    volume_mounts.extend(new_mounts)
+    # Collect all volume specs from all containers
+    v_specs, _ = build_volume_items(app.volumes)
+    pod_volumes.extend(v_specs)
 
-    # 7. Probes
-    liveness, readiness, startup = None, None, None
-    if app.health.enabled:
-        liveness = _build_probe(app.health.liveness, app.health, primary_container_port)
-        readiness = _build_probe(app.health.readiness, app.health, primary_container_port)
-        startup = _build_probe(app.health.startup, app.health, primary_container_port)
+    for c in app.initContainers + app.sidecars:
+        c_v_specs, _ = build_volume_items(c.volumes)
+        # Avoid duplicate volume names in Pod spec
+        existing_v_names = {v["name"] for v in pod_volumes}
+        for v in c_v_specs:
+            if v["name"] not in existing_v_names:
+                pod_volumes.append(v)
 
-    # 8. Service Configuration
-    #
-    # Service is enabled when:
-    #   - NOT explicitly disabled via `service: false`
-    #   - AND either explicitly configured OR the ingress requires a backend
+    # 6. Build Main Container
+    main_container = _build_container_dict(
+        name=app.name, # Fullname will be prepended by Helm, but we pass current name
+        container_cfg=app,
+        project=project,
+        project_vars=project_vars,
+        image_tag_override=image_tag,
+        is_main=True,
+        primary_port=primary_container_port,
+    )
+    # Main container ports are special because they come from AppConfig.ports or port
+    main_container["name"] = '{{ include "common-lib.name" . }}'
+    main_container["ports"] = [
+        {"name": p.name, "containerPort": p.targetPort or p.port, "protocol": p.protocol}
+        for p in all_ports
+    ]
+    # PY-H3 FIX: Use the already-resolved `image_name` variable instead of re-parsing
+    # the composed "image:tag" string. The old `split(":")[0]` approach breaks for
+    # registries with a port number (e.g. "registry:5000/app:v1" → split gives "registry").
+    main_container.pop("image")  # Remove composed image:tag from container dict
+    image_info = {
+        "repository": image_name,
+        "tag": tag,
+        "pullPolicy": main_container.pop("imagePullPolicy")
+    }
+
+    # 7. Build Init Containers
+    # Classic Init Containers (no restartPolicy): probes are NOT allowed by K8s spec.
+    # Native Sidecars (restartPolicy: Always): probes ARE allowed.
+    init_containers = []
+    for c in app.initContainers:
+        is_native_sidecar = c.restartPolicy == "Always"
+        init_containers.append(_build_container_dict(
+            name=c.name,
+            container_cfg=c,
+            project=project,
+            project_vars=project_vars,
+            image_tag_override=image_tag,
+            allow_probes=is_native_sidecar,  # Only native sidecars support probes
+            primary_port=primary_container_port,
+        ))
+
+    # 8. Build Sidecar Containers (traditional — run alongside main container)
+    # Traditional sidecars support the full lifecycle including probes.
+    sidecar_containers = []
+    for s in app.sidecars:
+        sidecar_containers.append(_build_container_dict(
+            name=s.name,
+            container_cfg=s,
+            project=project,
+            project_vars=project_vars,
+            image_tag_override=image_tag,
+            allow_probes=True,
+            primary_port=primary_container_port,
+        ))
+
+    # 9. Service Configuration
     svc_explicitly_disabled = app.service is False
     svc_explicitly_configured = isinstance(app.service, ServiceConfig)
     svc_enabled = not svc_explicitly_disabled and (svc_explicitly_configured or app.ingress.enabled)
@@ -717,26 +1145,26 @@ def build_values_yaml(
         if s.port and not any(p.port == s.port for p in source_ports):
             source_ports.insert(0, ServicePort(name="http", port=s.port, targetPort=s.targetPort))
         for p in (source_ports if source_ports else all_ports):
-            svc_ports.append({
+            port_entry = {
                 "name": p.name, "port": p.port,
                 "targetPort": p.targetPort or p.port,
-                "protocol": p.protocol, "nodePort": p.nodePort,
-            })
+                "protocol": p.protocol,
+            }
+            if p.nodePort is not None:
+                port_entry["nodePort"] = p.nodePort
+            svc_ports.append(port_entry)
         svc_values = {"enabled": True, "type": s.type, "ports": svc_ports, "annotations": s.annotations}
 
-    # 9. Ingress Configuration
+    # 10. Ingress Configuration
     ing_values: dict = {"enabled": False}
     if app.ingress.enabled:
         ing_values = app.ingress.model_dump(exclude_none=True)
-
-        # Expand shorthand host/path into hosts list
         if app.ingress.host and not app.ingress.hosts:
             ing_values["hosts"] = [{
                 "host": app.ingress.host,
                 "paths": [{"path": app.ingress.path or "/", "pathType": "ImplementationSpecific"}],
             }]
 
-        # Resolve default servicePort per path (explicit precedence: path > ingress > service > container)
         if app.ingress.servicePort:
             default_svc_port: Union[int, str] = app.ingress.servicePort
         elif svc_enabled and svc_ports:
@@ -749,89 +1177,77 @@ def build_values_yaml(
                 if not p.get("servicePort"):
                     p["servicePort"] = default_svc_port
 
-        # Merge Nginx default annotations with user-provided (user overrides defaults)
         final_annotations: dict[str, str] = {}
         if (app.ingress.className or "nginx") == "nginx":
             final_annotations.update(_NGINX_DEFAULT_ANNOTATIONS)
-        final_annotations.update(app.ingress.annotations)  # User values win
+        final_annotations.update(app.ingress.annotations)
         ing_values["annotations"] = final_annotations
 
-    # 10. Env Assembly
-    #
-    # Merge order (later entries take precedence in K8s if duplicate names):
-    #   Env vars:   legacy env[] → legacy env_vars → new envs[]
-    #   Env from:   project ConfigMap (if exists) → legacy envFrom[] → new envs[] envFrom entries
+    # 11. Assembly
+    # KEY DECISION: When HPA is enabled, omit 'replicas' from the Deployment spec.
+    # If 'replicas' is set, the Deployment controller will fight with HPA over the replica count,
+    # resetting it to the static value on every reconcile. The HPA takes sole ownership.
+    deploy_dict = {
+        "strategy": {"type": app.strategy},
+        # podSecurityContext is POD-level only: runAsUser/Group, fsGroup, supplementalGroups.
+        # Container-level fields (readOnlyRootFilesystem, capabilities) belong in securityContext.
+        "podSecurityContext": {**_DEFAULT_POD_SEC_CTX, **app.podSecurityContext},
+        "volumes": pod_volumes,
+        "affinity": app.affinity,
+        "tolerations": app.tolerations,
+        "imagePullSecrets": (
+            app.imagePullSecrets
+            or project.imagePullSecrets
+            or [{"name": DEFAULT_PULL_SECRET}]
+        ),
+        "podAnnotations": app.podAnnotations,
+        "initContainers": init_containers,
+        "sidecars": sidecar_containers, # This goes into the main containers array in template
+    }
+    # Only set static replicas when HPA is NOT managing the scaling
+    if not app.hpa.enabled:
+        deploy_dict["replicas"] = app.replicas
+    # Main container fields are flat in deployment values
+    deploy_dict.update(main_container)
 
-    # a) Legacy env[] — raw K8s EnvVar list
-    env_list: list = list(app.env)
+    # Build serviceAccount conditionally.
+    # by_alias=True: serialize 'automountToken' → 'automountServiceAccountToken'
+    # to match the Kubernetes API field name expected by Helm templates.
+    sa_dict = app.serviceAccount.model_dump(exclude_none=True, by_alias=True)
+    sa_name = app.serviceAccount.name or app.serviceAccountName
+    if sa_name and "name" not in sa_dict:
+        sa_dict["name"] = sa_name
 
-    # b) Legacy env_vars — always inject keys into secretKeyRef from project secret.
-    #    Warn if the key is not declared as a Vault placeholder in the .env file,
-    #    but inject anyway because the K8s Secret may have been populated externally.
-    for key in app.env_vars:
-        if key not in secret_pool:
-            print(
-                f"  [WARN] env_var '{key}' in app '{app.name}' is not declared in "
-                f"secret_pool (not found in .env as a ${{...}} placeholder). "
-                "Injecting anyway — ensure the key exists in the project Secret."
-            )
-        env_list.append({
-            "name": key,
-            "valueFrom": {"secretKeyRef": {"name": f"{project_name}-secret", "key": key}},
-        })
+    # 12. Service & Ingress: disabled for batch workloads (Job/CronJob have no inbound traffic)
+    is_batch = app.type in ("job", "cronjob")
+    if is_batch:
+        svc_values = {"enabled": False}
+        ing_values = {"enabled": False}
 
-    # c) New envs[] — env vars from EnvItem list
-    new_env_list, new_env_from_list = build_env_items(app.envs)
-    env_list.extend(new_env_list)
+    # 13. Job / CronJob config dicts
+    job_dict: dict = {}
+    if app.job:
+        job_dict = app.job.model_dump(exclude_none=True)
 
-    # d) Env from sources
-    env_from: list = []
-    # Only inject the project ConfigMap if it actually exists (i.e., .env file had config data)
-    if config_pool:
-        env_from.append({"configMapRef": {"name": f"{project_name}-config"}})
-    env_from.extend(app.envFrom)          # Legacy envFrom[]
-    env_from.extend(new_env_from_list)    # New envs[] envFrom entries
+    cronjob_dict: dict = {}
+    if app.cronjob:
+        cronjob_dict = app.cronjob.model_dump(exclude_none=True)
 
-    # 11. Container Ports
-    deploy_ports = [
-        {"name": p.name, "containerPort": p.targetPort or p.port, "protocol": p.protocol}
-        for p in all_ports
-    ]
+    # 14. HPA config
+    hpa_dict = app.hpa.model_dump(exclude_none=True)
 
     return {
         "type": app.type,
-        "image": {"repository": image_name, "tag": tag, "pullPolicy": app.pullPolicy},
-        "deployment": {
-            "replicas": app.replicas,
-            "containerPort": primary_container_port,
-            "ports": deploy_ports,
-            "resources": app.resources,
-            "strategy": {"type": app.strategy},
-            "securityContext": sec_ctx,
-            "envFrom": env_from,
-            "env": env_list,
-            "volumes": volumes,
-            "volumeMounts": volume_mounts,
-            "affinity": app.affinity,
-            "livenessProbe": liveness,
-            "readinessProbe": readiness,
-            "startupProbe": startup,
-            "imagePullSecrets": (
-                app.imagePullSecrets
-                or project.imagePullSecrets
-                or [{"name": DEFAULT_PULL_SECRET}]
-            ),
-            "podAnnotations": app.podAnnotations,
-        },
-        "serviceAccount": {
-            "create": app.serviceAccount.create,
-            "name": app.serviceAccount.name or app.serviceAccountName,
-            "automountServiceAccountToken": app.serviceAccount.automountToken,
-        },
+        "image": image_info,
+        "deployment": deploy_dict,
+        "serviceAccount": sa_dict,
         "service": svc_values,
         "ingress": ing_values,
         "pvc": app.pvc.model_dump(exclude_none=True),
         "localConfig": {"enabled": app.genConfigMaps},
+        "job": job_dict,
+        "cronjob": cronjob_dict,
+        "hpa": hpa_dict,
     }
 
 
@@ -870,7 +1286,21 @@ def main():
     parser.add_argument("--env", default="dev")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--image-tag")
+    parser.add_argument(
+        "--allow-latest",
+        action="store_true",
+        help="Allow 'latest' image tag. Without this flag, 'latest' only generates a warning.",
+    )
     args = parser.parse_args()
+
+    # Validate --env is a valid lowercase Kubernetes-compatible identifier.
+    # This prevents path traversal, typos like 'Production', and injection via shell expansion.
+    if not re.match(r'^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$', args.env):
+        print(
+            f"ERROR: --env '{args.env}' must be a valid lowercase identifier "
+            "(e.g. 'dev', 'stg', 'prod'). No uppercase, underscores, or special chars."
+        )
+        sys.exit(1)
 
     # Paths
     project_dir = REPO_ROOT / "projects" / args.env / args.project
@@ -916,6 +1346,8 @@ def main():
                 "version": "0.1.0",
             }
             write_yaml(shared_dir / "Chart.yaml", shared_chart, False)
+            # PY-M2 FIX: Generate empty values.yaml so Helm lint does not warn.
+            write_yaml(shared_dir / "values.yaml", {}, False)
 
             # Only write ConfigMap when there is actual non-secret data.
             # An empty ConfigMap causes unnecessary resource churn and confuses operators.
@@ -962,7 +1394,7 @@ def main():
             write_yaml(chart_dir / "Chart.yaml", desc, False)
             write_yaml(
                 chart_dir / "values.yaml",
-                build_values_yaml(app, project_def, project_vars, args.image_tag),
+                build_values_yaml(app, project_def, project_vars, args.image_tag, args.allow_latest),
                 False,
             )
 

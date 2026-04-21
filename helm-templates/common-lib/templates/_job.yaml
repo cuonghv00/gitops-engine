@@ -1,0 +1,60 @@
+{{/*
+================================================================================
+  common-lib/_job.yaml
+  Reusable template that renders a Kubernetes Job resource.
+  Invoked by _main.tpl when .Values.type == "job".
+  Pod spec is delegated to the shared "common-lib.podSpec" partial.
+
+  Relevant .Values.job fields:
+    completions             (int, optional)
+    parallelism             (int, optional)
+    backoffLimit            (int, optional, default 6 by K8s)
+    activeDeadlineSeconds   (int, optional)
+    ttlSecondsAfterFinished (int, optional)
+    restartPolicy           (string: Never | OnFailure, default: Never)
+================================================================================
+*/}}
+{{- define "common-lib.job" -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "common-lib.fullname" . }}
+  labels:
+    {{- include "common-lib.labels" . | nindent 4 }}
+  {{- with .Values.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* HELM-H1 FIX: Use 'hasKey' instead of falsy checks.
+       Values like backoffLimit: 0, completions: 0, parallelism: 0 are valid K8s values
+       but falsy in Go templates — the original 'if .field' would silently drop them. */}}
+  {{- with .Values.job }}
+  {{- if hasKey . "completions" }}
+  completions: {{ .completions }}
+  {{- end }}
+  {{- if hasKey . "parallelism" }}
+  parallelism: {{ .parallelism }}
+  {{- end }}
+  {{- if hasKey . "backoffLimit" }}
+  backoffLimit: {{ .backoffLimit }}
+  {{- end }}
+  {{- if hasKey . "activeDeadlineSeconds" }}
+  activeDeadlineSeconds: {{ .activeDeadlineSeconds }}
+  {{- end }}
+  {{- if hasKey . "ttlSecondsAfterFinished" }}
+  ttlSecondsAfterFinished: {{ .ttlSecondsAfterFinished }}
+  {{- end }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "common-lib.selectorLabels" . | nindent 8 }}
+      {{- with .Values.deployment.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: {{ (.Values.job).restartPolicy | default "Never" }}
+      {{- include "common-lib.podSpec" . | nindent 6 }}
+{{- end }}

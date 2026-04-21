@@ -7,30 +7,38 @@
 # Usage (VM):           ./vault_sync.sh vm <vault_path> <env_file>
 # ==============================================================================
 
-set -e
+# Strict mode: exit on errors, unbound vars, and pipe failures
+set -euo pipefail
+
+# --- Guard: VAULT_ADDR must be set
+if [[ -z "${VAULT_ADDR:-}" ]]; then
+    echo "ERROR: VAULT_ADDR environment variable is not set."
+    echo "       Export it before running: export VAULT_ADDR=https://vault.example.com"
+    exit 1
+fi
 
 # --- Argument Parsing ---
-if [ "$1" == "vm" ]; then
+if [ "${1:-}" == "vm" ]; then
     MODE="vm"
-    VAULT_PATH="$2"
-    ENV_FILE="$3"
-    
+    VAULT_PATH="${2:-}"
+    ENV_FILE="${3:-}"
+
     if [[ -z "$VAULT_PATH" || -z "$ENV_FILE" ]]; then
         echo "Usage (VM): $0 vm <vault_path> <env_file>"
         exit 1
     fi
 else
     MODE="k8s"
-    if [ "$1" == "k8s" ]; then
-        VAULT_PATH="$2"
-        SECRET_NAME="$3"
-        NAMESPACE="$4"
+    if [ "${1:-}" == "k8s" ]; then
+        VAULT_PATH="${2:-}"
+        SECRET_NAME="${3:-}"
+        NAMESPACE="${4:-}"
     else
-        VAULT_PATH="$1"
-        SECRET_NAME="$2"
-        NAMESPACE="$3"
+        VAULT_PATH="${1:-}"
+        SECRET_NAME="${2:-}"
+        NAMESPACE="${3:-}"
     fi
-    
+
     if [[ -z "$VAULT_PATH" || -z "$SECRET_NAME" || -z "$NAMESPACE" ]]; then
         echo "Usage (K8s): $0 <vault_path> <secret_name> <namespace>"
         exit 1
@@ -40,6 +48,14 @@ fi
 # --- Logic: Fetch Secrets ---
 fetch_secrets() {
     echo "▶ Fetching from Vault: ${VAULT_PATH}"
+
+    # Verify Vault token is valid before attempting to fetch secrets.
+    # This prevents leaking Vault path structure in error messages on auth failure.
+    if ! vault token lookup > /dev/null 2>&1; then
+        echo "ERROR: Vault token is invalid or expired. Run 'vault login' first."
+        exit 1
+    fi
+
     # Use -format=json and jq for reliable parsing
     RAW_DATA=$(vault kv get -format=json "${VAULT_PATH}")
     SH_DATA=$(echo "${RAW_DATA}" | jq -r '.data.data')
@@ -63,11 +79,14 @@ deploy_k8s() {
 }
 
 # --- Logic: Deploy to VM (.env file) ---
-# Hardened version using Python to safely handle special characters (No more sed injection)
+# SEC-01 FIX: Pass env_file via environment variable instead of shell string interpolation.
+# Original code embedded $file directly into a Python heredoc string — this is a shell
+# injection risk if ENV_FILE contains single quotes or special characters.
+# The safe pattern: export the value, read it inside Python via os.environ.
 deploy_vm() {
     local data="$1"
     local file="${ENV_FILE}"
-    
+
     if [[ ! -f "$file" ]]; then
         echo "▶ Creating file: ${file}"
         touch "$file"
@@ -75,15 +94,22 @@ deploy_vm() {
 
     echo "▶ Syncing to file: ${file} (Robust Upsert via Python)"
 
-    # Pass the entire JSON data to Python for processing
-    echo "${data}" | python3 -c "
+    # Export the path so Python can read it safely — avoids shell injection
+    export VAULT_ENV_FILE_TARGET="$file"
+
+    echo "${data}" | python3 - << 'PYEOF'
 import sys, json, os
 
-env_file = '$file'
+# Read the target file path from the environment — safe, no shell interpolation
+env_file = os.environ.get('VAULT_ENV_FILE_TARGET')
+if not env_file:
+    print('ERROR: VAULT_ENV_FILE_TARGET environment variable is not set.')
+    sys.exit(1)
+
 try:
     vault_data = json.load(sys.stdin)
 except Exception as e:
-    print(f'ERROR: Invalid JSON data: {e}')
+    print(f'ERROR: Invalid JSON data from Vault: {e}')
     sys.exit(1)
 
 # Read existing file
@@ -95,7 +121,7 @@ if os.path.exists(env_file):
 new_lines = []
 processed_keys = set()
 
-# Update existing keys
+# Update existing keys (upsert)
 for line in lines:
     clean_line = line.strip()
     if clean_line and not clean_line.startswith('#') and '=' in clean_line:
@@ -106,15 +132,16 @@ for line in lines:
             continue
     new_lines.append(line)
 
-# Add new keys
+# Append new keys not already in the file
 for key, value in vault_data.items():
     if key not in processed_keys:
         new_lines.append(f'{key}={value}\n')
 
 with open(env_file, 'w') as f:
     f.writelines(new_lines)
-"
-    # Ensure strict permissions for secret file
+PYEOF
+
+    # Ensure strict permissions for secret file (readable only by owner)
     chmod 600 "$file"
     echo "✅ VM Environment file updated (Permissions: 600)."
 }

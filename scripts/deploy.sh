@@ -10,7 +10,11 @@
 # Usage: ./deploy.sh --project <name> --env <dev|stg|prod> [--dry-run]
 # ==============================================================================
 
-set -e
+# SEC-02 FIX: Enable strict mode.
+#   -e: exit on any error
+#   -u: error on unbound variables (catches typos like $PORJECT)
+#   -o pipefail: catch failures inside pipes (e.g. vault kv get | jq)
+set -euo pipefail
 
 # Default values
 PROJECT=""
@@ -37,6 +41,18 @@ if [ -z "$PROJECT" ]; then
     exit 1
 fi
 
+# SEC-H1 FIX: Validate PROJECT and ENV to prevent path traversal and injection.
+# Uses the same regex as generator.py's --env validation for consistency.
+# Must be lowercase alphanumeric with dashes (valid K8s namespace name).
+if ! echo "$PROJECT" | grep -qE '^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$'; then
+    echo "ERROR: --project '${PROJECT}' must be a valid lowercase identifier (e.g. 'ecommerce', 'my-app')."
+    exit 1
+fi
+if ! echo "$ENV" | grep -qE '^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$'; then
+    echo "ERROR: --env '${ENV}' must be a valid lowercase identifier (e.g. 'dev', 'stg', 'prod')."
+    exit 1
+fi
+
 echo "=== Deployment Orchestrator ==="
 echo "Project : ${PROJECT}"
 echo "Env     : ${ENV}"
@@ -51,11 +67,14 @@ if [ -f "./.venv/bin/python3" ]; then
     echo "  - Using virtual environment: .venv"
 fi
 
-GEN_CMD="${PYTHON_BIN} scripts/generator.py --project ${PROJECT} --env ${ENV}"
-if [ ! -z "$IMAGE_TAG" ]; then
-    GEN_CMD="${GEN_CMD} --image-tag ${IMAGE_TAG}"
+# SEC-03 FIX: Use an array for the command to prevent word splitting and injection.
+# Never use: CMD="$BIN args..." ; $CMD  (unquoted → word splitting on spaces/IFS)
+# Always use: CMD=("$BIN" "arg1" "arg2") ; "${CMD[@]}"  (safe, handles spaces in args)
+GEN_CMD=("${PYTHON_BIN}" "scripts/generator.py" "--project" "${PROJECT}" "--env" "${ENV}")
+if [[ -n "${IMAGE_TAG}" ]]; then
+    GEN_CMD+=("--image-tag" "${IMAGE_TAG}")
 fi
-$GEN_CMD
+"${GEN_CMD[@]}"
 
 # 2. Validate with Helm Lint (Optimized: Only changed charts)
 TARGET_DIR="projects/${ENV}/${PROJECT}/charts"

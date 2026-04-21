@@ -1,0 +1,50 @@
+{{/*
+================================================================================
+  common-lib/_hpa.yaml
+  Renders a HorizontalPodAutoscaler (autoscaling/v2, stable from K8s 1.23+).
+  Invoked by _main.tpl when .Values.hpa.enabled == true and type == "deployment".
+
+  Supported metrics:
+    .Values.hpa.targetCPUUtilizationPercentage    — Resource / CPU / Utilization
+    .Values.hpa.targetMemoryUtilizationPercentage — Resource / Memory / Utilization
+
+  Note: 'replicas' is intentionally omitted from the Deployment when HPA is enabled.
+  The HPA takes sole ownership of the replica count to avoid a reconcile conflict.
+================================================================================
+*/}}
+{{- define "common-lib.hpa" -}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "common-lib.fullname" . }}
+  labels:
+    {{- include "common-lib.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "common-lib.fullname" . }}
+  minReplicas: {{ .Values.hpa.minReplicas | default 1 }}
+  maxReplicas: {{ .Values.hpa.maxReplicas | default 5 }}
+  metrics:
+    {{- if .Values.hpa.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.hpa.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetMemoryUtilizationPercentage }}
+    {{- end }}
+  {{- with .Values.hpa.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

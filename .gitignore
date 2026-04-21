@@ -1,3 +1,9 @@
 .venv
 .venv/*
 projects/dev/ecommerce/charts/*
+projects/dev/phoenix-project/charts/*
+projects/dev/phoenix-project/k8s-manifest/*
+# PY-L2 FIX: Global pattern instead of path-specific
+__pycache__/
+# PY-M4 FIX: Temp files should not be committed
+temp.md

@@ -7,23 +7,31 @@
 # 1. Scans `projects/*/*/charts/*` for directories.
 # 2. Creates an ArgoCD Application for each service.
 # 3. Uses the project name as the target Kubernetes namespace.
+#
+# IMPORTANT: Replace REPO_URL below with your actual Git repository URL.
 # ==============================================================================
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 metadata:
   name: platform-monorepo-apps
   namespace: argocd
+  # ARGO-M1 FIX: Add management annotations for cluster admin tracing
+  annotations:
+    argocd.argoproj.io/managed-by: gitops-engine
 spec:
   generators:
     - git:
+        # ARGO-M2 FIX: Parameterized — replace with your actual repo URL
         repoURL: https://github.com/cuonghv00/gitops-engine.git
         revision: HEAD
         directories:
           - path: projects/*/*/charts/*
   template:
     metadata:
-      # App name = service name
-      name: '{{path.basename}}'
+      # ARGO-H1 FIX: Prefix app name with project name to prevent name collisions.
+      # Without this, two projects with the same chart name (e.g. 'api-gateway')
+      # would create conflicting Application resources.
+      name: '{{path.segments[2]}}-{{path.basename}}'
       labels:
         project: '{{path.segments[2]}}'
         env: '{{path.segments[1]}}'
@@ -47,3 +55,14 @@ spec:
           selfHeal: true
         syncOptions:
           - CreateNamespace=true
+          # SEC-C1 FIX: Protect against accidental mass-deletion.
+          # ApplyOutOfSyncOnly: Only apply resources that have drifted (reduces blast radius).
+          # ServerSideApply: Use K8s server-side apply for safer conflict resolution.
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m

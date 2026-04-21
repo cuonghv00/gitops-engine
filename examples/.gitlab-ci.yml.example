@@ -1,10 +1,14 @@
 # examples/.gitlab-ci.yml.example
 # ==============================================================================
 # GitLab CI Pipeline Example for Helm Monorepo Optimization
+#
+# SEC-M1 FIX: Updated to use SSH deploy key pattern (matches main .gitlab-ci.yml)
+# PY-L4 FIX: Updated Python image to 3.11-slim
 # ==============================================================================
 
 stages:
   - build
+  - test
   - sync-secrets
   - deploy-orchestration
 
@@ -17,50 +21,74 @@ variables:
   VAULT_AUTH_ROLE: "gitlab-ci-role"
 
 .base-job:
-  image: python:3.9-slim
+  image: python:3.11-slim
   before_script:
-    - apt-get update && apt-get install -y git jq curl
-    - pip install pyyaml
-    # Set up Git for pushback
+    - apt-get update && apt-get install -y git jq curl ssh-client
+    - pip install -r scripts/requirements.txt
+    # Install Helm (pinned version)
+    - curl -fsSL https://get.helm.sh/helm-v3.15.0-linux-amd64.tar.gz | tar xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+    # Set up Git for pushback via SSH deploy key
     - git config --global user.name "GitLab CI Bot"
     - git config --global user.email "ci-bot@example.com"
-    # Use CI_JOB_TOKEN to allow push back to the repo
-    - git remote set-url origin "https://oauth2:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$CI_SSH_DEPLOY_KEY" | tr -d '\r' | ssh-add - 2>/dev/null || true
+    - ssh-keyscan "${CI_SERVER_HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
+    - |
+      if ssh-add -l > /dev/null 2>&1; then
+        git remote set-url origin "git@${CI_SERVER_HOST}:${CI_PROJECT_PATH}.git"
+      else
+        echo "FATAL: CI_SSH_DEPLOY_KEY is not configured."
+        exit 1
+      fi
 
-# 1. Build and Push (Simplified)
+# 1. Build and Push
 build-image:
   stage: build
-  image: docker:20.10.16
+  image: docker:24.0
   services:
-    - docker:20.10.16-dind
+    - docker:24.0-dind
   script:
     - docker build -t ${DOCKER_IMAGE}:${IMAGE_TAG} .
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
     - docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
-  only:
-    - main
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
 
-# 2. Sync Secrets from Vault
+# 2. Run Tests
+run-tests:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install -r scripts/requirements.txt
+  script:
+    - python -m pytest scripts/test_generator.py -v --tb=short
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - scripts/**/*
+        - projects/**/*.yaml
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# 3. Sync Secrets from Vault
 sync-secrets:
   stage: sync-secrets
   extends: .base-job
   script:
     - chmod +x scripts/vault_sync.sh
-    # ./vault_sync.sh <team> <project> <env> <namespace>
-    - ./scripts/vault_sync.sh ecommerce ecommerce dev ecommerce
-  only:
-    - main
+    - ./scripts/vault_sync.sh "secret/data/team/ecommerce/dev" "ecommerce-secret" "ecommerce"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
 
-# 3. Generate Charts and Push Back to Git
+# 4. Generate Charts and Push Back to Git
 orchestrate-deploy:
   stage: deploy-orchestration
   extends: .base-job
+  needs:
+    - job: run-tests
+      optional: true
+  resource_group: git-push-lock
   script:
     - chmod +x scripts/deploy.sh
-    # This script will: 
-    #   1. Gen charts with --image-tag $IMAGE_TAG
-    #   2. Git commit & push back to this repo
-    #   3. ArgoCD will then pick up the changes
     - ./scripts/deploy.sh --project ecommerce --env dev --image-tag ${IMAGE_TAG}
-  only:
-    - main
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'

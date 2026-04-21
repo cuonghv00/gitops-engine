@@ -3,6 +3,7 @@
   common-lib/_deployment.yaml
   Reusable template that renders a Kubernetes Deployment resource.
   Invoked by main.yaml when .Values.type == "deployment".
+  Pod spec is delegated to the shared "common-lib.podSpec" partial.
 ================================================================================
 */}}
 {{- define "common-lib.deployment" -}}
@@ -17,7 +18,13 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  replicas: {{ .Values.deployment.replicas | default 1 }}
+  {{- /* HELM-01 FIX: Use 'hasKey' instead of a falsy check.
+       'if .Values.deployment.replicas' would silently drop 'replicas: 0' (suspend a deployment).
+       HPA mode: generator omits this key entirely → hasKey returns false → correct, no replicas field.
+       Static mode: generator sets it to N → hasKey returns true → rendered correctly. */}}
+  {{- if hasKey .Values.deployment "replicas" }}
+  replicas: {{ .Values.deployment.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "common-lib.selectorLabels" . | nindent 6 }}
@@ -32,70 +39,5 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
-      {{- with .Values.deployment.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      serviceAccountName: {{ include "common-lib.serviceAccountName" . }}
-      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken | default false }}
-      securityContext:
-        {{- toYaml (.Values.deployment.podSecurityContext | default dict) | nindent 8 }}
-      containers:
-        - name: {{ include "common-lib.name" . }}
-          {{- with .Values.deployment.securityContext }}
-          securityContext:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
-          ports:
-            {{- if .Values.deployment.ports }}
-            {{- toYaml .Values.deployment.ports | nindent 12 }}
-            {{- else }}
-            - name: http
-              containerPort: {{ .Values.deployment.containerPort | default 80 }}
-              protocol: TCP
-            {{- end }}
-          {{- with .Values.deployment.env }}
-          env:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.deployment.envFrom }}
-          envFrom:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- if .Values.deployment.livenessProbe }}
-          livenessProbe:
-            {{- toYaml .Values.deployment.livenessProbe | nindent 12 }}
-          {{- end }}
-          {{- if .Values.deployment.readinessProbe }}
-          readinessProbe:
-            {{- toYaml .Values.deployment.readinessProbe | nindent 12 }}
-          {{- end }}
-          {{- if .Values.deployment.startupProbe }}
-          startupProbe:
-            {{- toYaml .Values.deployment.startupProbe | nindent 12 }}
-          {{- end }}
-          resources:
-            {{- toYaml (.Values.deployment.resources | default dict) | nindent 12 }}
-          {{- with .Values.deployment.volumeMounts }}
-          volumeMounts:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-      {{- with .Values.deployment.volumes }}
-      volumes:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.deployment.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.deployment.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.deployment.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "common-lib.podSpec" . | nindent 6 }}
 {{- end }}

@@ -1,0 +1,71 @@
+{{/*
+================================================================================
+  common-lib/_cronjob.yaml
+  Reusable template that renders a Kubernetes CronJob resource.
+  Invoked by _main.tpl when .Values.type == "cronjob".
+
+  Relevant .Values.cronjob fields:
+    schedule                    (string, REQUIRED, e.g. "0 2 * * *")
+    concurrencyPolicy           (string: Allow | Forbid | Replace, default Allow)
+    suspend                     (bool, default false)
+    successfulJobsHistoryLimit  (int, default 3)
+    failedJobsHistoryLimit      (int, default 1)
+    startingDeadlineSeconds     (int, optional)
+
+  Job pod template fields (same as Job):
+    job.completions, job.parallelism, job.backoffLimit,
+    job.activeDeadlineSeconds, job.ttlSecondsAfterFinished, job.restartPolicy
+================================================================================
+*/}}
+{{- define "common-lib.cronjob" -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "common-lib.fullname" . }}
+  labels:
+    {{- include "common-lib.labels" . | nindent 4 }}
+  {{- with .Values.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  schedule: {{ required ".Values.cronjob.schedule is required for type=cronjob" .Values.cronjob.schedule | quote }}
+  concurrencyPolicy: {{ (.Values.cronjob).concurrencyPolicy | default "Allow" }}
+  suspend: {{ (.Values.cronjob).suspend | default false }}
+  successfulJobsHistoryLimit: {{ (.Values.cronjob).successfulJobsHistoryLimit | default 3 }}
+  failedJobsHistoryLimit: {{ (.Values.cronjob).failedJobsHistoryLimit | default 1 }}
+  {{- if (.Values.cronjob).startingDeadlineSeconds }}
+  startingDeadlineSeconds: {{ .Values.cronjob.startingDeadlineSeconds }}
+  {{- end }}
+  jobTemplate:
+    spec:
+      {{- /* HELM-H2 FIX: Use 'hasKey' — same pattern as _job.yaml */}}
+      {{- with .Values.job }}
+      {{- if hasKey . "completions" }}
+      completions: {{ .completions }}
+      {{- end }}
+      {{- if hasKey . "parallelism" }}
+      parallelism: {{ .parallelism }}
+      {{- end }}
+      {{- if hasKey . "backoffLimit" }}
+      backoffLimit: {{ .backoffLimit }}
+      {{- end }}
+      {{- if hasKey . "activeDeadlineSeconds" }}
+      activeDeadlineSeconds: {{ .activeDeadlineSeconds }}
+      {{- end }}
+      {{- if hasKey . "ttlSecondsAfterFinished" }}
+      ttlSecondsAfterFinished: {{ .ttlSecondsAfterFinished }}
+      {{- end }}
+      {{- end }}
+      template:
+        metadata:
+          labels:
+            {{- include "common-lib.selectorLabels" . | nindent 12 }}
+          {{- with .Values.deployment.podAnnotations }}
+          annotations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        spec:
+          restartPolicy: {{ (.Values.job).restartPolicy | default "Never" }}
+          {{- include "common-lib.podSpec" . | nindent 10 }}
+{{- end }}

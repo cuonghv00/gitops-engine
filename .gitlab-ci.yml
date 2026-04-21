@@ -4,6 +4,7 @@
 # ==============================================================================
 
 stages:
+  - test                  # CI-03: Run tests BEFORE generating/committing charts
   - sync-secrets
   - deploy-orchestration
 
@@ -19,14 +20,55 @@ variables:
 .base-script:
   image: python:3.11-slim
   before_script:
-    - apt-get update && apt-get install -y git jq curl unzip
-    - pip install pyyaml
-    # Set up Git for pushback (Requires CI_PUSH_TOKEN in GitLab variables)
+    - apt-get update && apt-get install -y git jq curl unzip ssh-client
+    # CI-M1 FIX: Install Helm (pinned version) for 'helm lint' in deploy.sh
+    - curl -fsSL https://get.helm.sh/helm-v3.15.0-linux-amd64.tar.gz | tar xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+    # CI-01 FIX: Install ALL dependencies from requirements.txt (was missing pydantic)
+    - pip install -r scripts/requirements.txt
+    # CI-02 FIX: Use SSH deploy key instead of embedding a token in the remote URL.
+    # The HTTPS approach leaks the token into git logs, 'git remote -v' output, and error messages.
+    # Setup: generate an SSH deploy key, add public key to repo, store private key as CI_SSH_DEPLOY_KEY.
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$CI_SSH_DEPLOY_KEY" | tr -d '\r' | ssh-add - 2>/dev/null || true
+    - ssh-keyscan "${CI_SERVER_HOST}" >> ~/.ssh/known_hosts 2>/dev/null || true
     - git config --global user.name "GitOps Bot"
     - git config --global user.email "bot@devops.vn"
-    # Use CI_JOB_TOKEN or an SSH/Personal Token for pushing to the repo
-    - git remote set-url origin "https://oauth2:${GITLAB_API_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    # Switch remote to SSH only if deploy key is available
+    - |
+      if ssh-add -l > /dev/null 2>&1; then
+        git remote set-url origin "git@${CI_SERVER_HOST}:${CI_PROJECT_PATH}.git"
+        echo "  - Using SSH deploy key for Git authentication."
+      else
+        # SEC-C2 FIX: Fail hard when SSH deploy key is unavailable.
+        # The old HTTP token fallback embedded CI_PUSH_TOKEN in the git remote URL,
+        # leaking credentials into 'git remote -v', error messages, and process lists.
+        echo "  - FATAL: CI_SSH_DEPLOY_KEY is not configured."
+        echo "  - Git push requires an SSH deploy key. See README for setup instructions."
+        exit 1
+      fi
 
+# ─── Stage 1: Test ────────────────────────────────────────────────────────────
+# CI-03 FIX: Always run unit tests before any generation or commit step.
+# Prevents broken generator code from being committed back to the repository.
+run-tests:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install -r scripts/requirements.txt
+  script:
+    - echo "▶ Running generator unit tests..."
+    - python -m pytest scripts/test_generator.py -v --tb=short
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      changes:
+        - scripts/generator.py
+        - scripts/test_generator.py
+        - scripts/requirements.txt
+        # CI-H1 FIX: Also run tests when app config changes — config data can trigger bugs
+        - projects/**/*.yaml
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# ─── Stage 2: Sync Secrets ────────────────────────────────────────────────────
 # 1. Sync Secrets from Vault (K8s or VM mode)
 sync-vault-secrets:
   stage: sync-secrets
@@ -41,10 +83,16 @@ sync-vault-secrets:
         - projects/$ENV/$PROJECT/apps.$ENV.yaml
         - scripts/vault_sync.sh
 
+# ─── Stage 3: Deploy Orchestration ───────────────────────────────────────────
 # 2. Orchestrate Deployment (Generate, Commit, and Push back)
 deploy-orchestration:
   stage: deploy-orchestration
   extends: .base-script
+  # CI-H2 FIX: Ensure tests pass before deploying.
+  # optional: true allows deploy to proceed when test stage is skipped (no file changes).
+  needs:
+    - job: run-tests
+      optional: true
   resource_group: git-push-lock # Avoid concurrent push conflicts
   script:
     - chmod +x scripts/deploy.sh
