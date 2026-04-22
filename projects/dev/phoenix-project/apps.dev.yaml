@@ -156,6 +156,8 @@ apps:
       backoffLimit: 3
       ttlSecondsAfterFinished: 600   # Cleanup pods after 10 minutes
       restartPolicy: OnFailure
+      completionMode: Indexed        # New generic Job field allowed by extra='allow'
+      suspend: true                  # New generic Job field allowed by extra='allow'
 
   # ----------------------------------------------------------------------------
   # EXAMPLE 7: Database Backup (CronJob)
@@ -165,7 +167,7 @@ apps:
   - name: backup-db
     type: cronjob
     image: registry.vn/phoenix-project/backup:v1.0.0
-    command: ["/backup.sh"]
+    command: /backup.sh              # String command unpacked automatically by the new feature!
     resources:
       limits:
         cpu: "200m"
@@ -182,3 +184,24 @@ apps:
       backoffLimit: 2
       activeDeadlineSeconds: 3600    # Abort if still running after 1 hour
       ttlSecondsAfterFinished: 86400 # Cleanup after 24 hours
+
+  # ----------------------------------------------------------------------------
+  # EXAMPLE 8: Feature Test (K8s Escape Hatch & secretEnv logic)
+  # Demonstrates direct native K8s overrides and full secret injection
+  # ----------------------------------------------------------------------------
+  - name: test-escape-hatch
+    image: alpine:latest
+    port: 8080
+    envs:
+      - secretEnv: phoenix-project-secret  # Loads entire secret via envFrom since 'vars' is omitted!
+    k8s:
+      pod:
+        hostAliases:
+          - ip: "10.0.0.99"
+            hostnames:
+              - "internal-svc.local"
+      mainContainer:
+        command: sh -c "echo OVERRIDDEN BY K8S ESCAPE && sleep 3600"
+      deployment:
+        strategy:
+          type: Recreate

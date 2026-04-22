@@ -26,25 +26,9 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- /* HELM-H1 FIX: Use 'hasKey' instead of falsy checks.
-       Values like backoffLimit: 0, completions: 0, parallelism: 0 are valid K8s values
-       but falsy in Go templates — the original 'if .field' would silently drop them. */}}
-  {{- with .Values.job }}
-  {{- if hasKey . "completions" }}
-  completions: {{ .completions }}
-  {{- end }}
-  {{- if hasKey . "parallelism" }}
-  parallelism: {{ .parallelism }}
-  {{- end }}
-  {{- if hasKey . "backoffLimit" }}
-  backoffLimit: {{ .backoffLimit }}
-  {{- end }}
-  {{- if hasKey . "activeDeadlineSeconds" }}
-  activeDeadlineSeconds: {{ .activeDeadlineSeconds }}
-  {{- end }}
-  {{- if hasKey . "ttlSecondsAfterFinished" }}
-  ttlSecondsAfterFinished: {{ .ttlSecondsAfterFinished }}
-  {{- end }}
+  {{- /* All unknown job configs are dumped here via extra='allow' in JobConfig */}}
+  {{- with omit .Values.job "restartPolicy" }}
+  {{- toYaml . | nindent 2 }}
   {{- end }}
   template:
     metadata:

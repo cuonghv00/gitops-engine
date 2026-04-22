@@ -35,6 +35,7 @@ from scripts.generator import (
     VolumeItem,
     ProjectPVC,
     ServicePort,
+    ServiceConfig,
     ExtraContainerConfig,
     JobConfig,
     CronJobConfig,
@@ -84,21 +85,54 @@ class TestEnvItemValidation:
         e = EnvItem(secret="api-keys")
         assert e.secret == "api-keys"
 
-    def test_k8s_native_env(self):
-        e = EnvItem(k8s={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}})
-        assert "name" in e.k8s
-
     def test_multiple_sources_raises(self):
         with pytest.raises(Exception):
             EnvItem(name="X", configMap="Y")
 
-    def test_secretenv_without_vars_raises(self):
-        with pytest.raises(Exception):
-            EnvItem(secretEnv="sec")
+    def test_secretenv_without_vars_injects_envfrom(self):
+        item = EnvItem(secretEnv="my-secret")
+        assert item.secretEnv == "my-secret"
+        assert item.vars is None
 
     def test_empty_envitem_raises(self):
         with pytest.raises(Exception):
             EnvItem()
+
+
+# ===========================================================================
+# 1b. EnvItem — valueFrom shorthand (Phase 2)
+# ===========================================================================
+
+class TestEnvItemValueFrom:
+    def test_valuefrom_fieldref_valid(self):
+        e = EnvItem(name="POD_IP", valueFrom={"fieldRef": {"fieldPath": "status.podIP"}})
+        assert e.valueFrom["fieldRef"]["fieldPath"] == "status.podIP"
+
+    def test_valuefrom_resourcefieldref_valid(self):
+        e = EnvItem(name="CPU", valueFrom={"resourceFieldRef": {"resource": "requests.cpu"}})
+        assert e.valueFrom is not None
+
+    def test_valuefrom_in_env_list(self):
+        envs = [EnvItem(name="POD_IP", valueFrom={"fieldRef": {"fieldPath": "status.podIP"}})]
+        env_list, _ = build_env_items(envs)
+        assert any(
+            e.get("name") == "POD_IP" and "valueFrom" in e
+            for e in env_list
+        )
+
+    def test_valuefrom_and_value_raises(self):
+        with pytest.raises(Exception, match="cannot both be set"):
+            EnvItem(name="X", value="literal", valueFrom={"fieldRef": {"fieldPath": "status.podIP"}})
+
+    def test_name_with_value_still_works(self):
+        e = EnvItem(name="LOG", value="debug")
+        assert e.value == "debug"
+        assert e.valueFrom is None
+
+    def test_name_without_value_or_valuefrom_valid(self):
+        # name alone (no value) is a valid K8s env var reference
+        e = EnvItem(name="EMPTY_VAR")
+        assert e.name == "EMPTY_VAR"
 
 
 # ===========================================================================
@@ -113,7 +147,6 @@ class TestBuildEnvItems:
             EnvItem(secretEnv="proj-secret", vars=["DB_PASS", "API_KEY"]),
             EnvItem(configMap="global-cm"),
             EnvItem(secret="ext-secret"),
-            EnvItem(k8s={"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}),
         ]
         self.env_list, self.env_from = build_env_items(envs)
 
@@ -134,9 +167,6 @@ class TestBuildEnvItems:
 
     def test_secret_in_env_from(self):
         assert {"secretRef": {"name": "ext-secret"}} in self.env_from
-
-    def test_k8s_env_in_env_list(self):
-        assert any(e.get("name") == "POD_IP" for e in self.env_list)
 
 
 # ===========================================================================
@@ -187,13 +217,6 @@ class TestVolumeItemValidation:
         )
         assert isinstance(v.secret, dict)
 
-    def test_k8s_escape_hatch(self):
-        v = VolumeItem(k8s={
-            "volume": {"name": "nfs", "nfs": {"server": "nfs.example.com", "path": "/exports"}},
-            "mount": {"mountPath": "/mnt/nfs", "readOnly": True},
-        })
-        assert "volume" in v.k8s
-
     def test_multiple_sources_raises(self):
         with pytest.raises(Exception):
             VolumeItem(name="x", mountPath="/x", pvc="y", emptyDir={})
@@ -216,10 +239,6 @@ class TestBuildVolumeItems:
             VolumeItem(name="logs", mountPath="/var/log", hostPath="/var/log/nodes"),
             VolumeItem(name="cfg", mountPath="/etc/app", configMap="my-cm"),
             VolumeItem(name="certs", mountPath="/certs", secret="tls-secret"),
-            VolumeItem(k8s={
-                "volume": {"name": "nfs", "nfs": {"server": "nfs.example.com", "path": "/exports"}},
-                "mount": {"mountPath": "/mnt/nfs"},
-            }),
         ]
         self.vol_specs, self.mount_specs = build_volume_items(volumes)
 
@@ -261,12 +280,6 @@ class TestBuildVolumeItems:
             v.get("secret", {}).get("secretName") == "tls-secret"
             for v in self.vol_specs
         )
-
-    def test_k8s_volume_preserved(self):
-        assert any(v.get("name") == "nfs" and "nfs" in v for v in self.vol_specs)
-
-    def test_k8s_mount_has_name(self):
-        assert any(m.get("name") == "nfs" for m in self.mount_specs)
 
 
 # ===========================================================================
@@ -1161,3 +1174,169 @@ class TestResourceLimitsWarning:
         build_values_yaml(app, base_project, ({}, []))
         captured = capsys.readouterr()
         assert "no resource limits defined" not in captured.out
+
+
+# ===========================================================================
+# 24. VolumeItem — Native volume types: nfs, csi, projected (Phase 3)
+# ===========================================================================
+
+class TestVolumeItemNativeTypes:
+    def test_nfs_valid(self):
+        v = VolumeItem(name="nfs", mountPath="/mnt", nfs={"server": "nfs.local", "path": "/data"})
+        assert v.nfs["server"] == "nfs.local"
+
+    def test_nfs_volume_spec(self):
+        v = VolumeItem(name="nfs", mountPath="/mnt/nfs", nfs={"server": "nfs.local", "path": "/data"})
+        specs, mounts = build_volume_items([v])
+        assert specs[0]["nfs"]["server"] == "nfs.local"
+        assert specs[0]["name"] == "nfs"
+        assert mounts[0]["mountPath"] == "/mnt/nfs"
+
+    def test_csi_valid(self):
+        v = VolumeItem(name="csi-vol", mountPath="/mnt/csi", csi={"driver": "secrets-store.csi.k8s.io", "readOnly": True})
+        specs, _ = build_volume_items([v])
+        assert "csi" in specs[0]
+        assert specs[0]["csi"]["driver"] == "secrets-store.csi.k8s.io"
+
+    def test_projected_valid(self):
+        v = VolumeItem(
+            name="proj", mountPath="/var/proj",
+            projected={"sources": [{"secret": {"name": "s1"}}, {"configMap": {"name": "cm1"}}]},
+        )
+        specs, _ = build_volume_items([v])
+        assert "projected" in specs[0]
+        assert len(specs[0]["projected"]["sources"]) == 2
+
+    def test_nfs_multiple_sources_raises(self):
+        with pytest.raises(Exception):
+            VolumeItem(name="x", mountPath="/x", nfs={"server": "s"}, pvc="y")
+
+    def test_nfs_readonly_mount(self):
+        v = VolumeItem(name="nfs", mountPath="/mnt", readOnly=True, nfs={"server": "nfs.local", "path": "/"})
+        _, mounts = build_volume_items([v])
+        assert mounts[0].get("readOnly") is True
+
+
+# ===========================================================================
+# 25. AppConfig — strategy Union[str, dict] (Phase 4.1)
+# ===========================================================================
+
+class TestStrategyConfig:
+    def test_strategy_string_shorthand(self, base_project):
+        app = AppConfig(name="app", port=8080, strategy="Recreate")
+        v = build_values_yaml(app, base_project, ({}, []))
+        assert v["deployment"]["strategy"] == {"type": "Recreate"}
+
+    def test_strategy_full_object(self, base_project):
+        app = AppConfig(
+            name="app", port=8080,
+            strategy={"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 2, "maxUnavailable": 0}},
+        )
+        v = build_values_yaml(app, base_project, ({}, []))
+        assert v["deployment"]["strategy"]["rollingUpdate"]["maxSurge"] == 2
+
+    def test_strategy_default_is_rollingupdate(self, base_project):
+        app = AppConfig(name="app", port=8080)
+        v = build_values_yaml(app, base_project, ({}, []))
+        assert v["deployment"]["strategy"]["type"] == "RollingUpdate"
+
+
+# ===========================================================================
+# 26. AppConfig — nodeSelector + podLabels (Phase 4.2 + 4.3)
+# ===========================================================================
+
+class TestNodeSelectorAndPodLabels:
+    def test_nodeselector_in_values(self, base_project):
+        app = AppConfig(name="app", port=8080, nodeSelector={"node-type": "compute"})
+        v = build_values_yaml(app, base_project, ({}, []))
+        assert v["deployment"]["nodeSelector"] == {"node-type": "compute"}
+
+    def test_podlabels_in_values(self, base_project):
+        app = AppConfig(name="app", port=8080, podLabels={"team": "platform", "tier": "backend"})
+        v = build_values_yaml(app, base_project, ({}, []))
+        assert v["deployment"]["podLabels"]["team"] == "platform"
+
+    def test_empty_nodeselector_default(self, base_project):
+        app = AppConfig(name="app", port=8080)
+        v = build_values_yaml(app, base_project, ({}, []))
+        assert v["deployment"]["nodeSelector"] == {}
+
+
+# ===========================================================================
+# 27. K8sOverrides — k8s.job + k8s.cronjob scopes (Phase 4.4)
+# ===========================================================================
+
+class TestK8sJobOverride:
+    def test_k8s_job_merged_into_job_dict(self, batch_project):
+        app = AppConfig(
+            name="mig", type="job",
+            image="migrator:v1",
+            job={"backoffLimit": 3, "restartPolicy": "Never"},
+            k8s={"job": {"completionMode": "Indexed"}},
+        )
+        v = build_values_yaml(app, batch_project, ({}, []), allow_latest=True)
+        assert v["job"]["completionMode"] == "Indexed"
+        assert v["job"]["backoffLimit"] == 3
+
+    def test_k8s_job_does_not_override_job_scalar(self, batch_project):
+        # k8s.job override replaces scalars (deep_update semantics)
+        app = AppConfig(
+            name="mig2", type="job",
+            image="migrator:v1",
+            job={"backoffLimit": 3, "restartPolicy": "Never"},
+            k8s={"job": {"backoffLimit": 10}},
+        )
+        v = build_values_yaml(app, batch_project, ({}, []), allow_latest=True)
+        assert v["job"]["backoffLimit"] == 10
+
+
+# ===========================================================================
+# 28. deep_update — list dedup by key/name (Phase 1.3)
+# ===========================================================================
+
+class TestDeepUpdateDedup:
+    def test_extend_without_duplicate_by_key(self):
+        from scripts.generator import deep_update
+        base = {"tolerations": [{"key": "dedicated", "value": "gpu"}]}
+        override = {"tolerations": [{"key": "dedicated", "value": "cpu"}]}  # same key
+        result = deep_update(base, override)
+        assert len(result["tolerations"]) == 1  # Deduped — not added
+
+    def test_extend_new_entry_added(self):
+        from scripts.generator import deep_update
+        base = {"tolerations": [{"key": "gpu", "value": "true"}]}
+        override = {"tolerations": [{"key": "spot", "value": "true"}]}  # different key
+        result = deep_update(base, override)
+        assert len(result["tolerations"]) == 2  # Both kept
+
+    def test_dict_merge_recursive(self):
+        from scripts.generator import deep_update
+        base = {"a": {"x": 1, "y": 2}}
+        override = {"a": {"y": 99, "z": 3}}
+        result = deep_update(base, override)
+        assert result["a"] == {"x": 1, "y": 99, "z": 3}
+
+    def test_scalar_overwrite(self):
+        from scripts.generator import deep_update
+        base = {"replicas": 1}
+        override = {"replicas": 5}
+        result = deep_update(base, override)
+        assert result["replicas"] == 5
+
+
+# ===========================================================================
+# 29. ServiceConfig — Literal type validation (Phase 4.5)
+# ===========================================================================
+
+class TestServiceConfigType:
+    def test_valid_clusterip(self):
+        svc = ServiceConfig()
+        assert svc.type == "ClusterIP"
+
+    def test_valid_nodeport(self):
+        svc = ServiceConfig(type="NodePort")
+        assert svc.type == "NodePort"
+
+    def test_invalid_type_raises(self):
+        with pytest.raises(Exception):
+            ServiceConfig(type="InvalidType")

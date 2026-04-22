@@ -29,33 +29,13 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  schedule: {{ required ".Values.cronjob.schedule is required for type=cronjob" .Values.cronjob.schedule | quote }}
-  concurrencyPolicy: {{ (.Values.cronjob).concurrencyPolicy | default "Allow" }}
-  suspend: {{ (.Values.cronjob).suspend | default false }}
-  successfulJobsHistoryLimit: {{ (.Values.cronjob).successfulJobsHistoryLimit | default 3 }}
-  failedJobsHistoryLimit: {{ (.Values.cronjob).failedJobsHistoryLimit | default 1 }}
-  {{- if (.Values.cronjob).startingDeadlineSeconds }}
-  startingDeadlineSeconds: {{ .Values.cronjob.startingDeadlineSeconds }}
-  {{- end }}
+  {{- /* All unknown cronjob configs are dumped here via extra='allow' in CronJobConfig */}}
+  {{- toYaml .Values.cronjob | nindent 2 }}
   jobTemplate:
     spec:
-      {{- /* HELM-H2 FIX: Use 'hasKey' — same pattern as _job.yaml */}}
-      {{- with .Values.job }}
-      {{- if hasKey . "completions" }}
-      completions: {{ .completions }}
-      {{- end }}
-      {{- if hasKey . "parallelism" }}
-      parallelism: {{ .parallelism }}
-      {{- end }}
-      {{- if hasKey . "backoffLimit" }}
-      backoffLimit: {{ .backoffLimit }}
-      {{- end }}
-      {{- if hasKey . "activeDeadlineSeconds" }}
-      activeDeadlineSeconds: {{ .activeDeadlineSeconds }}
-      {{- end }}
-      {{- if hasKey . "ttlSecondsAfterFinished" }}
-      ttlSecondsAfterFinished: {{ .ttlSecondsAfterFinished }}
-      {{- end }}
+      {{- /* All unknown job configs are dumped here via extra='allow' in JobConfig */}}
+      {{- with omit .Values.job "restartPolicy" }}
+      {{- toYaml . | nindent 6 }}
       {{- end }}
       template:
         metadata:

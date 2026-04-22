@@ -7,6 +7,7 @@ A production-grade Helm Monorepo framework designed to standardize Kubernetes de
 ## Table of Contents
 
 - [Introduction and Architecture](#introduction-and-architecture)
+- [Design Philosophy: 3-Layer Configuration Model](#design-philosophy-3-layer-configuration-model)
 - [Repository Structure](#repository-structure)
 - [Workflow](#workflow)
 - [Getting Started](#getting-started)
@@ -18,6 +19,173 @@ A production-grade Helm Monorepo framework designed to standardize Kubernetes de
 - [Best Practices](#best-practices)
 
 ---
+
+## Design Philosophy: 3-Layer Configuration Model
+
+GitOps Engine uses a **3-layer progressive disclosure model**. Operators only need to know the layer relevant to their use case. Each layer is a superset of the previous.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Layer 3 — Native Escape Hatch  (k8s:)                    ~5% usage  │
+│  Full K8s API at any spec level for advanced cases                   │
+├──────────────────────────────────────────────────────────────────────┤
+│  Layer 2 — Config Objects                                ~15% usage  │
+│  Rich objects for less-common but structured options                 │
+├──────────────────────────────────────────────────────────────────────┤
+│  Layer 1 — Shorthand                                     ~80% usage  │
+│  Concise keys covering the most common deployment needs              │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Layer 1 — Shorthand (80% of use cases)
+
+Simple, flat keys for the most common options. No deep nesting required.
+
+```yaml
+- name: my-api
+  port: 8080
+  replicas: 3
+  image: registry.vn/platform/my-api:v1.2.0
+
+  health:
+    enabled: true
+    path: /healthz
+
+  resources:
+    limits:   { cpu: "500m", memory: "512Mi" }
+    requests: { cpu: "100m", memory: "128Mi" }
+
+  envs:
+    - name: LOG_LEVEL
+      value: "info"
+    - secretEnv: my-api-secret        # inject all keys from secret via envFrom
+    - name: POD_IP                    # Downward API shorthand
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+
+  volumes:
+    - name: cache
+      mountPath: /tmp/cache
+      emptyDir: {}
+    - name: nfs-data                  # NFS shorthand — no escape hatch needed
+      mountPath: /mnt/data
+      nfs:
+        server: nfs.internal
+        path: /exports/data
+
+  ingress:
+    enabled: true
+    host: my-api.example.com
+```
+
+### Layer 2 — Config Objects (15% of use cases)
+
+Structured objects for options that have multiple sub-fields or multiple modes.
+
+```yaml
+- name: web-frontend
+  # Full RollingUpdate tuning (Lớp 1 only supports type string)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+
+  # NodePort service with explicit port mapping
+  service:
+    type: NodePort
+    ports:
+      - name: http
+        port: 80
+        targetPort: 8080
+        nodePort: 30080
+
+  # HPA with behavior tuning
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+
+  # CronJob with full scheduling options
+  cronjob:
+    schedule: "0 2 * * *"
+    concurrencyPolicy: Forbid
+    successfulJobsHistoryLimit: 5
+
+  # Job with retry and TTL options
+  job:
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 3600
+    restartPolicy: OnFailure
+```
+
+### Layer 3 — Native Escape Hatch (5% of use cases)
+
+When Layers 1 and 2 are not sufficient, use the `k8s:` block to deep-merge native
+Kubernetes fields at any spec level. The engine performs a recursive strategic merge —
+existing fields are preserved unless explicitly overridden.
+
+```yaml
+- name: legacy-bridge
+  k8s:
+    # pod: → merges into Pod spec
+    pod:
+      hostAliases:
+        - ip: "10.0.0.99"
+          hostnames: ["internal-svc.local"]
+      dnsPolicy: "None"
+      dnsConfig:
+        nameservers: ["10.96.0.10"]
+
+    # mainContainer: → merges into main container spec
+    mainContainer:
+      lifecycle:
+        preStop:
+          exec:
+            command: ["/bin/sh", "-c", "sleep 10"]
+
+    # deployment: → merges into Deployment spec
+    deployment:
+      minReadySeconds: 15
+      progressDeadlineSeconds: 600
+
+    # service: / ingress: → merge into Service / Ingress spec
+    service:
+      sessionAffinity: ClientIP
+
+    # job: / cronjob: → merge into Job / CronJob spec
+    job:
+      podFailurePolicy:
+        rules:
+          - action: FailJob
+            onExitCodes:
+              operator: In
+              values: [42]
+    cronjob:
+      timeZone: "Asia/Ho_Chi_Minh"
+```
+
+**Design rules for `k8s:`:**
+
+| Rule | Detail |
+|------|--------|
+| **Merge, not replace** | `deep_update` merges dicts recursively; scalars are overwritten |
+| **List dedup** | Lists are extended, deduplicated by `name`/`key` field |
+| **Last wins** | `k8s:` overrides are applied **after** all generator logic |
+| **Full K8s API** | Any valid Kubernetes field can be declared — no whitelist |
+
+> [!TIP]
+> Start with Layer 1. Only move to Layer 2 when you need structured options.
+> Only use `k8s:` as a last resort — if a field is frequently needed, it should
+> become a Layer 1 or Layer 2 option in a future release.
+
+---
+
 
 ## Introduction and Architecture
 
@@ -459,6 +627,7 @@ All application configuration is defined in `apps.<env>.yaml`. The generator val
 | `image` | string | `null` | Full image URI (e.g., `redis:7.2-alpine`, `gcr.io/proj/app:v1`) |
 | `image_tag` | string | `null` | Per-app tag override |
 | `pullPolicy` | string | `"IfNotPresent"` | Image pull policy |
+| `k8s` | object | `{}` | **Native Escape Hatch** - Deep-merge K8s overrides for `pod`, `deployment`, `mainContainer`, `service`, `ingress` |
 
 #### Networking
 
@@ -521,18 +690,14 @@ envs:
   - secretEnv: my-project-secret
     vars: [DB_PASSWORD, API_KEY]
 
+  # Inject ALL keys from a Vault-synced secret (envFrom) by omitting 'vars'
+  - secretEnv: my-project-secret
+
   # Inject all keys from a ConfigMap
   - configMap: global-config
 
   # Inject all keys from a Secret
   - secret: external-api-keys
-
-  # Native K8s EnvVar (Downward API, resourceFieldRef)
-  - k8s:
-      name: POD_IP
-      valueFrom:
-        fieldRef:
-          fieldPath: status.podIP
 ```
 
 #### Volumes
@@ -559,17 +724,11 @@ volumes:
     mountPath: /etc/ssl/certs
     secret: tls-cert
     readOnly: true
-
-  # Native K8s (NFS, CSI, Projected)
-  - k8s:
-      volume:
-        name: nfs-data
-        nfs: { server: nfs.example.com, path: /exports }
-      mount:
-        mountPath: /mnt/nfs
 ```
 
 #### Batch Workloads
+
+`job` and `cronjob` blocks are dynamic: **all native K8s fields are allowed and passed seamlessly** to the manifests (e.g., `completionMode`, `suspend`, `activeDeadlineSeconds`). Common properties include:
 
 | Field | Type | Default | Description |
 |:---|:---|:---|:---|

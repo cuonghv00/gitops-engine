@@ -94,4 +94,7 @@ affinity:
 tolerations:
   {{- toYaml . | nindent 2 }}
 {{- end }}
+{{- with .Values.deployment.k8sPod }}
+{{- toYaml . | nindent 0 }}
+{{- end }}
 {{- end }}

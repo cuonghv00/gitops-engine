@@ -34,10 +34,16 @@ spec:
     metadata:
       labels:
         {{- include "common-lib.selectorLabels" . | nindent 8 }}
+        {{- with .Values.deployment.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.deployment.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
       {{- include "common-lib.podSpec" . | nindent 6 }}
+  {{- with .Values.deployment.k8sDeployment }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
 {{- end }}

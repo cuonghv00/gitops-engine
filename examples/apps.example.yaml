@@ -2,6 +2,11 @@
 # ==============================================================================
 # Comprehensive Application Definition Example
 # Use this as a template for your project configuration.
+#
+# 3-layer config model:
+#   Lớp 1 — Shorthand (80% use-cases): port, health, resources, envs, volumes, ingress, hpa
+#   Lớp 2 — Config objects (15% use-cases): service, strategy, job, cronjob
+#   Lớp 3 — Native escape hatch (5% use-cases): k8s.pod, k8s.deployment, k8s.mainContainer
 # ==============================================================================
 
 project: "example-project"
@@ -29,7 +34,7 @@ pvcs:
 
 apps:
   # ----------------------------------------------------------------------------
-  # CASE 1: Simple Web Service
+  # CASE 1: Simple Web Service — Lớp 1 only, minimal config
   # ----------------------------------------------------------------------------
   - name: "web-portal"
     port: 80
@@ -39,9 +44,16 @@ apps:
       host: "portal.example.com"
     health:
       enabled: true
+    resources:
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
 
   # ----------------------------------------------------------------------------
-  # CASE 2: Flattened Envs — all env declaration styles
+  # CASE 2: All Env Declaration Styles
   # ----------------------------------------------------------------------------
   - name: "backend-api"
     port: 3000
@@ -49,36 +61,41 @@ apps:
       port: 80           # Service port 80 → container port 3000
 
     envs:
-      # Style 1: Plain value
+      # Style 1: Plain key-value
       - name: LOG_LEVEL
         value: "debug"
 
       # Style 2: Per-key secretKeyRef (Vault-synced secret → K8s Secret)
-      # Injects each key as its own env var via secretKeyRef
       - secretEnv: example-project-secret
         vars:
           - DATABASE_URL
           - API_KEY
 
-      # Style 3: Inject all keys from a ConfigMap via envFrom
+      # Style 3: Inject ALL keys from a secret (envFrom — omit vars)
+      - secretEnv: shared-credentials
+
+      # Style 4: Inject all keys from a ConfigMap via envFrom
       - configMap: global-feature-flags
 
-      # Style 4: Inject all keys from a Secret via envFrom
+      # Style 5: Inject all keys from a Secret via envFrom
       - secret: external-api-keys
 
-      # Style 5: Raw K8s EnvVar spec (escape hatch for complex cases)
-      # k8s: Native K8s EnvVar spec — for Downward API, resourceFieldRef, etc.
-      - k8s:
-          name: POD_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.podIP
+      # Style 6: Downward API — Pod metadata & resource fields
+      - name: POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
 
-      - k8s:
-          name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
+      - name: POD_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+
+      - name: CPU_REQUEST
+        valueFrom:
+          resourceFieldRef:
+            containerName: backend-api
+            resource: requests.cpu
 
     resources:
       limits:
@@ -89,7 +106,7 @@ apps:
         memory: "128Mi"
 
   # ----------------------------------------------------------------------------
-  # CASE 3: Flattened Volumes — all volume source types + mount options
+  # CASE 3: All Volume Source Types + Mount Options
   # ----------------------------------------------------------------------------
   - name: "data-processor"
     port: 8080
@@ -107,7 +124,7 @@ apps:
         mountPath: /var/lib/db
         pvc: db-data
 
-      # EmptyDir (in-memory)
+      # EmptyDir (in-memory ramdisk)
       - name: memory-cache
         mountPath: /tmp/cache
         emptyDir:
@@ -140,7 +157,7 @@ apps:
         mountPath: /etc/nginx/conf.d
         configMap: nginx-config
 
-      # Secret mounted as files (e.g. TLS certs, SSH keys)
+      # Secret mounted as files (TLS certs, SSH keys)
       - name: tls-certs
         mountPath: /etc/ssl/certs
         readOnly: true
@@ -157,16 +174,33 @@ apps:
         mountPath: /run/secrets/token
         secret: api-token-secret
 
-      # k8s: Full K8s Volume + VolumeMount spec — NFS, CSI, Projected, etc.
-      - k8s:
-          volume:
-            name: nfs-archive
-            nfs:
-              server: nfs.example.com
-              path: /exports/archive
-          mount:
-            mountPath: /mnt/archive
-            readOnly: true
+      # NFS — network filesystem shorthand (Lớp 2)
+      - name: nfs-archive
+        mountPath: /mnt/archive
+        readOnly: true
+        nfs:
+          server: nfs.example.com
+          path: /exports/archive
+
+      # CSI — external storage driver (e.g. Secrets Store CSI)
+      - name: vault-secrets
+        mountPath: /mnt/secrets
+        readOnly: true
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: vault-provider
+
+      # Projected — combine multiple sources into one volume
+      - name: combined-auth
+        mountPath: /var/auth
+        projected:
+          sources:
+            - secret:
+                name: db-credentials
+            - configMap:
+                name: app-config
 
   # ----------------------------------------------------------------------------
   # CASE 4: Stateful Service (legacy pvc field — still works for simple cases)
@@ -235,3 +269,126 @@ apps:
               pathType: "Prefix"
             - path: "/static"
               pathType: "ImplementationSpecific"
+
+  # ----------------------------------------------------------------------------
+  # CASE 7: Lớp 2 — Strategy object + nodeSelector + podLabels
+  # ----------------------------------------------------------------------------
+  - name: "worker-service"
+    port: 8080
+    replicas: 3
+
+    # Lớp 2: Full strategy object with rolling update tuning
+    strategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxSurge: 2
+        maxUnavailable: 0
+
+    # Node affinity shorthand
+    nodeSelector:
+      node-type: compute
+      kubernetes.io/os: linux
+
+    # Extra labels injected into Pod metadata (for monitoring, cost allocation, etc.)
+    podLabels:
+      team: platform
+      tier: backend
+      cost-center: "engineering"
+
+    resources:
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+      requests:
+        cpu: "200m"
+        memory: "256Mi"
+
+  # ----------------------------------------------------------------------------
+  # CASE 8: Lớp 3 — Native K8s Escape Hatch (k8s:)
+  # ----------------------------------------------------------------------------
+  - name: "legacy-bridge"
+    image: alpine:latest
+    port: 8080
+
+    envs:
+      - secretEnv: legacy-secret   # All keys loaded via envFrom (no vars)
+
+    # k8s: — deep-merge overrides at each spec level
+    k8s:
+      pod:
+        # Pod-level overrides — hostAliases, dnsPolicy, dnsConfig, etc.
+        hostAliases:
+          - ip: "10.0.0.99"
+            hostnames:
+              - "internal-svc.local"
+              - "legacy-api.local"
+        dnsPolicy: "None"
+        dnsConfig:
+          nameservers:
+            - "10.0.0.10"
+          searches:
+            - "svc.cluster.local"
+
+      mainContainer:
+        # Container-level overrides — lifecycle hooks, stdin, etc.
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 5"]
+
+      deployment:
+        # Deployment spec overrides — minReadySeconds, progressDeadlineSeconds, etc.
+        minReadySeconds: 10
+        progressDeadlineSeconds: 300
+
+  # ----------------------------------------------------------------------------
+  # CASE 9: Full Job Options Support + k8s.job escape hatch
+  # ----------------------------------------------------------------------------
+  - name: "db-migrate"
+    type: job
+    image: my-migrator:v2.1.0
+    command: "/app/migrate --env prod --run"   # String parsed into array via shlex
+
+    job:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 600
+      restartPolicy: OnFailure
+      activeDeadlineSeconds: 1800
+      # Any K8s Job standard parameters are allowed (extra='allow')
+      completionMode: Indexed
+      completions: 5
+      parallelism: 2
+
+    # k8s.job — escape hatch for advanced Job specs not in JobConfig
+    k8s:
+      job:
+        podFailurePolicy:
+          rules:
+            - action: FailJob
+              onExitCodes:
+                operator: In
+                values: [42]
+
+  # ----------------------------------------------------------------------------
+  # CASE 10: CronJob with Full Options + k8s.cronjob escape hatch
+  # ----------------------------------------------------------------------------
+  - name: "nightly-report"
+    type: cronjob
+    image: reporter:v1.0.0
+
+    cronjob:
+      schedule: "0 2 * * *"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 5
+      failedJobsHistoryLimit: 3
+      startingDeadlineSeconds: 300
+
+    job:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 86400
+      restartPolicy: Never
+
+    # k8s.cronjob — escape hatch for CronJob-specific advanced fields
+    k8s:
+      cronjob:
+        timeZone: "Asia/Ho_Chi_Minh"   # K8s 1.27+ chrono timezone support
