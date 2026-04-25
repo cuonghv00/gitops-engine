@@ -25,16 +25,23 @@ spec:
         repoURL: https://github.com/cuonghv00/gitops-engine.git
         revision: HEAD
         directories:
-          - path: projects/*/*/charts/*
+          # Structure: projects/<team>/<project>/<project>-<env>/<app-chart>
+          # segments[0]=projects, segments[1]=team, segments[2]=project, segments[3]=<project>-<env>, basename=<app-chart>
+          - path: projects/*/*/*/*
+          # Exclude project-shared — it is managed as a separate ArgoCD Application (infra lifecycle)
+          - path: projects/*/*/*/project-shared
+            exclude: true
   template:
     metadata:
       # ARGO-H1 FIX: Prefix app name with project name to prevent name collisions.
       # Without this, two projects with the same chart name (e.g. 'api-gateway')
       # would create conflicting Application resources.
+      # segments[2]=<project>, basename=<app-chart>
       name: '{{path.segments[2]}}-{{path.basename}}'
       labels:
         project: '{{path.segments[2]}}'
-        env: '{{path.segments[1]}}'
+        team: '{{path.segments[1]}}'
+        env: '{{path.segments[3]}}'
     spec:
       # Grouping by ArgoCD Project
       project: '{{path.segments[2]}}'

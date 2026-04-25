@@ -19,6 +19,7 @@ set -euo pipefail
 # Default values
 PROJECT=""
 ENV="dev"
+TEAM=""
 DRY_RUN=false
 IMAGE_TAG=""
 GIT_USER="bot-generator"
@@ -27,6 +28,7 @@ GIT_EMAIL="bot@devops.vn"
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
+        --team) TEAM="$2"; shift ;;
         --project) PROJECT="$2"; shift ;;
         --env) ENV="$2"; shift ;;
         --image-tag) IMAGE_TAG="$2"; shift ;;
@@ -40,9 +42,13 @@ if [ -z "$PROJECT" ]; then
     echo "ERROR: --project is required."
     exit 1
 fi
+if [ -z "$TEAM" ]; then
+    echo "ERROR: --team is required."
+    exit 1
+fi
 
-# SEC-H1 FIX: Validate PROJECT and ENV to prevent path traversal and injection.
-# Uses the same regex as generator.py's --env validation for consistency.
+# SEC-H1 FIX: Validate PROJECT, ENV, and TEAM to prevent path traversal and injection.
+# Uses the same regex as generator.py for consistency.
 # Must be lowercase alphanumeric with dashes (valid K8s namespace name).
 if ! echo "$PROJECT" | grep -qE '^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$'; then
     echo "ERROR: --project '${PROJECT}' must be a valid lowercase identifier (e.g. 'ecommerce', 'my-app')."
@@ -52,8 +58,13 @@ if ! echo "$ENV" | grep -qE '^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$'; then
     echo "ERROR: --env '${ENV}' must be a valid lowercase identifier (e.g. 'dev', 'stg', 'prod')."
     exit 1
 fi
+if ! echo "$TEAM" | grep -qE '^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$'; then
+    echo "ERROR: --team '${TEAM}' must be a valid lowercase identifier (e.g. 'ops-team', 'backend')."
+    exit 1
+fi
 
 echo "=== Deployment Orchestrator ==="
+echo "Team    : ${TEAM}"
 echo "Project : ${PROJECT}"
 echo "Env     : ${ENV}"
 echo "Dry Run : ${DRY_RUN}"
@@ -70,14 +81,14 @@ fi
 # SEC-03 FIX: Use an array for the command to prevent word splitting and injection.
 # Never use: CMD="$BIN args..." ; $CMD  (unquoted → word splitting on spaces/IFS)
 # Always use: CMD=("$BIN" "arg1" "arg2") ; "${CMD[@]}"  (safe, handles spaces in args)
-GEN_CMD=("${PYTHON_BIN}" "scripts/generator.py" "--project" "${PROJECT}" "--env" "${ENV}")
+GEN_CMD=("${PYTHON_BIN}" "scripts/generator.py" "--team" "${TEAM}" "--project" "${PROJECT}" "--env" "${ENV}")
 if [[ -n "${IMAGE_TAG}" ]]; then
     GEN_CMD+=("--image-tag" "${IMAGE_TAG}")
 fi
 "${GEN_CMD[@]}"
 
 # 2. Validate with Helm Lint (Optimized: Only changed charts)
-TARGET_DIR="projects/${ENV}/${PROJECT}/charts"
+TARGET_DIR="projects/${TEAM}/${PROJECT}/${PROJECT}-${ENV}"
 if [ ! -d "$TARGET_DIR" ]; then
     echo "ERROR: Target directory ${TARGET_DIR} does not exist after generation."
     exit 1

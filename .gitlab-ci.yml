@@ -12,9 +12,10 @@ variables:
   # Default project for the pipeline
   PROJECT: "ecommerce"
   ENV: "dev"
+  TEAM: "ops-team"
   # Vault configurations
   VAULT_ADDR: "https://vault.example.com"
-  TEAM: "ops-team"
+
 
 # Base configuration for scripts
 .base-script:
@@ -80,7 +81,7 @@ sync-vault-secrets:
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes:
-        - projects/$ENV/$PROJECT/apps.$ENV.yaml
+        - projects/$TEAM/$PROJECT/$PROJECT-$ENV.yaml
         - scripts/vault_sync.sh
 
 # ─── Stage 3: Deploy Orchestration ───────────────────────────────────────────
@@ -97,11 +98,12 @@ deploy-orchestration:
   script:
     - chmod +x scripts/deploy.sh
     # Automatically uses $CI_PIPELINE_ID as image tag for immutability
-    - ./scripts/deploy.sh --project "$PROJECT" --env "$ENV" --image-tag "$CI_PIPELINE_ID"
+    - ./scripts/deploy.sh --team "$TEAM" --project "$PROJECT" --env "$ENV" --image-tag "$CI_PIPELINE_ID"
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
       changes:
-        - projects/$ENV/$PROJECT/apps.$ENV.yaml
+        - projects/$TEAM/$PROJECT/$PROJECT-$ENV.yaml
+        - projects/$TEAM/$PROJECT/$PROJECT-$ENV.env
         - helm-templates/**/*
         - scripts/deploy.sh
         - scripts/generator.py
